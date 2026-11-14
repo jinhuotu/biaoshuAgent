@@ -1,0 +1,693 @@
+"""Draft responses to commercial clauses without changing the bid outline."""
+
+from __future__ import annotations
+
+from api.services.tenders.prompts import get_prompt
+from api.services.tenders.generation_parallel import complete_json
+
+import json
+import logging
+import re
+
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from api.services.tenders.assets import load_invitation_text
+from api.services.tenders.schema import BidBrief, BidRequirement, DeviationLine, OutlineItem
+from api.services.tenders.scoring_points import classify_response, criterion_terms, validate_declaration
+from common.errors import AppError
+from db.models.knowledge import KnowledgeDocument
+
+_BIZ_WORDS = (
+    "付款",
+    "合同",
+    "有效期",
+    "响应期",
+    "资质",
+    "资格",
+    "信誉",
+    "营业执照",
+    "业绩",
+    "承诺",
+    "保证金",
+    "交货",
+    "工期",
+    "质保",
+    "保修",
+    "优惠",
+    "交付",
+    "验收",
+    "售后",
+    "培训",
+    "资信",
+    "价格",
+)
+_REQ_WORDS = (
+    "应",
+    "须",
+    "必须",
+    "要求",
+    "不少于",
+    "不得",
+    "提供",
+    "具备",
+    "期限",
+    "比例",
+    "金额",
+)
+_PRIMARY_WORDS = ("付款", "合同条款", "合同条件", "响应期", "有效期", "商务偏离", "商务承诺")
+_EVIDENCE_WORDS = ("资质", "资格", "信誉", "业绩", "营业执照", "财务", "信用", "承诺")
+_SECONDARY_WORDS = ("保证金", "交货", "工期", "质保", "保修", "优惠")
+_SUBSTANTIAL = re.compile(r"不得|必须|应|需提供|须|★|※|▲|重要性")
+_SCORE_WORDS = ("价格", "业绩", "资信", "承诺", "优惠", "商务")
+_REVIEW_RULE = re.compile(
+    r"(?:商务|技术|价格|综合)(?:标|部分)?得分(?:等于|[=＝])"
+    r"|评审(?:的)?业绩规定|评审规则|评审程序|评标办法"
+    r"|评分标准|评分方法|计分方法|分值构成|得分计算|满分|加分|扣分|得\d+(?:\.\d+)?分"
+)
+_RESPONSE_ACTION = re.compile(
+    r"(?:应当|应|须|必须|需|不得).{0,12}(?:提供|提交|具备|满足|符合|承诺|执行|支付|完成|保证)"
+    r"|(?:提供|提交).{0,30}(?:证明|合同|证书|承诺|材料|复印件|扫描件)"
+)
+logger = logging.getLogger("api.tenders.gen_biz_resp")
+
+
+def write_declaration(item_name: str, criterion: str, facts: dict, brief: BidBrief, chapter: str = "", *, with_ref: bool = False) -> str:
+    """Write a factual four-part commercial scoring response."""
+    project = str(facts.get("项目名称") or brief.projectName or "本项目")
+    fact_text = "；".join(f"{key}为{value}" for key, value in facts.items() if value not in (None, ""))
+    fact_text = fact_text or f"{project}按招标文件明确的实施条件组织响应"
+    terms = criterion_terms(criterion)
+    focus = "、".join(terms[:6]) or item_name
+    text = (
+        f"{project}的{item_name}，我方已结合{fact_text}明确响应边界和工作目标。\n\n"
+        f"总体思路：我方围绕{focus}建立工作清单；我方将按阶段组织协调、过程检查和成果确认；我方承诺以记录、复核和闭环整改保证要求落实。\n\n"
+        f"具体做法：我方将按招标文件和已核实事实执行，设置节点检查、责任交接和问题销项；我方每周复核进展，发现偏差立即启动纠偏，并在验收节点提交完整记录。\n\n"
+        f"保障机制：我方已建立项目负责人统筹、专业人员协同、风险预警和结果复盘机制，保证{criterion or item_name}逐项落地。"
+    )
+    if with_ref:
+        text += "\n上述人员证书及证明材料随本章资格审查资料一并提供。"
+    return text
+
+
+def business_requirements(brief: BidBrief, invitation: str) -> list[BidRequirement]:
+    """Keep only commercial clauses, including lines the generic classifier missed."""
+    from api.services.tenders.classifier import extract_requirements
+
+    candidates = [*brief.bidRequirements, *extract_requirements(invitation)]
+    for raw in (invitation or "").splitlines():
+        line = re.sub(r"\s+", " ", raw).strip()
+        if (
+            10 <= len(line) <= 180
+            and any(w in line for w in _BIZ_WORDS)
+            and any(w in line for w in _REQ_WORDS)
+        ):
+            candidates.append(BidRequirement(text=line, volume="business", category="commercial"))
+    seen: set[str] = set()
+    ranked: list[tuple[int, BidRequirement]] = []
+    for row in candidates:
+        line = (row.text or "").strip()
+        key = re.sub(r"\s+", "", line)
+        if not key or key in seen or row.volume == "technical" or row.category == "technical":
+            continue
+        if not any(w in line for w in _BIZ_WORDS):
+            continue
+        if (
+            row.volume != "business"
+            and row.category not in {"qualification", "performance", "financial", "commercial"}
+            and not any(w in line for w in _BIZ_WORDS)
+        ):
+            continue
+        if any(w in line for w in ("目录", "装订", "页码", "投标文件格式")):
+            continue
+        if any(w in line for w in ("评标委员会", "评审因素", "电子投标文件制作工具", "定标委员会")):
+            continue
+        # 评分规则留给 _business_scores 作上下文，只有可履行/举证的义务才逐条响应。
+        if (row.category == "scoring" or _REVIEW_RULE.search(key)) and not _RESPONSE_ACTION.search(key):
+            continue
+        priority = (
+            4
+            if row.volume == "business" or row.targetKind == "biz_dev"
+            else 3
+            if any(w in line for w in _PRIMARY_WORDS)
+            else 2
+            if row.category == "scoring" or any(w in line for w in _EVIDENCE_WORDS)
+            else 1
+            if any(w in line for w in _SECONDARY_WORDS)
+            else 0
+        )
+        if not priority:
+            continue
+        seen.add(key)
+        ranked.append((priority, row))
+    ranked.sort(key=lambda pair: -pair[0])
+    critical = [
+        row for _, row in ranked if row.strength == "mandatory" or _SUBSTANTIAL.search(row.text)
+    ]
+    ordinary = [
+        row
+        for _, row in ranked
+        if row.strength != "mandatory" and not _SUBSTANTIAL.search(row.text)
+    ]
+    return [*critical, *ordinary[:50]]
+
+
+def _business_scores(brief: BidBrief, invitation: str) -> list[tuple[str, str]]:
+    """Extract commercial score rows and their stated weights without inventing scores."""
+    candidates = [
+        (row.text, f"{row.scoreWeight:g}分" if row.scoreWeight is not None else "")
+        for row in brief.bidRequirements
+        if row.volume != "technical"
+        and row.category == "scoring"
+        and any(word in (row.text or "") for word in _SCORE_WORDS)
+    ]
+    in_business = False
+    for raw in (invitation or "").splitlines():
+        line = re.sub(r"\s+", "", raw).strip("| ")
+        if re.search(r"(?:商务|价格)(?:评分|评审|得分|部分)", line):
+            in_business = True
+        elif re.search(r"技术(?:评分|评审|得分|部分)", line):
+            in_business = False
+        if in_business and 8 <= len(line) <= 180 and any(w in line for w in _SCORE_WORDS):
+            if re.search(r"\d+(?:\.\d+)?分|评分|得分|分值", line):
+                candidates.append((line[:120], ""))
+    result = []
+    seen = set()
+    for text, stated_weight in candidates:
+        key = re.sub(r"\s+", "", text)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        weight = re.search(r"(\d+(?:\.\d+)?)\s*分", text)
+        result.append(
+            (text, stated_weight or (f"{weight.group(1)}分" if weight else "权重\u3010\u5f85\u8865\u5145\u3011"))
+        )
+        if len(result) >= 30:
+            break
+    return result
+
+
+def _substantial_clauses(requirements: list[BidRequirement]) -> list[BidRequirement]:
+    return [
+        row
+        for row in requirements
+        if row.strength == "mandatory" or _SUBSTANTIAL.search(row.text or "")
+    ]
+
+
+def _writing_style(docs: list[dict]) -> str:
+    """Reduce retrieved examples to style cues; never place historical facts in the prompt."""
+    blob = "\n".join(str(row.get("content") or "")[:2000] for row in docs if isinstance(row, dict))
+    if not blob:
+        return ""
+    cues = []
+    if re.search(r"(?:^|\n)\s*(?:[一二三四五六七八九十]|\d+)[、.．]", blob):
+        cues.append("按条款编号逐项回应")
+    for cue, words in (
+        ("先列承诺，再列履约依据", ("承诺", "履约")),
+        ("将证明材料列在响应之后", ("证明材料", "附件", "佐证")),
+        ("对付款、交付、验收分别说明", ("付款", "交付", "验收")),
+        ("对售后、培训与质保写明服务动作", ("售后", "培训", "质保")),
+    ):
+        if any(word in blob for word in words):
+            cues.append(cue)
+    return "；".join(cues) or "逐条写招标条款、响应动作、证据来源及需核实事项"
+
+
+async def _won_business_docs(db: AsyncSession | None, docs: list[dict]) -> list[dict]:
+    """Use only winning business chapters when recall has database provenance."""
+    ids = [str(doc.get("docId") or "").strip() for doc in docs if isinstance(doc, dict)]
+    ids = [doc_id for doc_id in ids if doc_id]
+    if not ids or db is None:
+        return docs
+    result = await db.execute(
+        select(KnowledgeDocument.public_id, KnowledgeDocument.tags).where(
+            KnowledgeDocument.public_id.in_(ids)
+        )
+    )
+    allowed = {
+        public_id
+        for public_id, tags in result.all()
+        if {"tech_bid", "volume:business", "outcome:won"}.issubset(set(tags or []))
+    }
+    return [doc for doc in docs if str(doc.get("docId") or "") in allowed]
+
+
+def _chapter_role(item: OutlineItem) -> str:
+    from api.services.tenders.business_draft_policy import chapter_role
+
+    return chapter_role(item)
+
+
+def _evidence(brief: BidBrief, library_facts: list[dict]) -> str:
+    lines = [f"项目名称：{brief.projectName}"] if brief.projectName else []
+    lines.append(f"本次投标人：{brief.bidderName or '\u3010\u5f85\u8865\u5145\u3011'}")
+    if brief.bidContent:
+        lines.append(f"项目内容：{brief.bidContent}")
+    if (brief.extraNote or "").strip():
+        lines.append(f"用户商务补充说明：{brief.extraNote.strip()}")
+    if brief.bidPriceYuan > 0:
+        lines.append(f"用户报价：{brief.bidPriceYuan} 元")
+    for row in brief.performanceLines:
+        if row.includeInBid and row.projectName and row.projectName not in {"待补充", "\u3010\u5f85\u8865\u5145\u3011"}:
+            lines.append(
+                f"用户选定业绩：{row.projectName}；{row.summary or row.spec or '详情待核'}"
+            )
+    from common.config import get_settings
+    from api.services.tenders.evidence import evidence_chunks, format_records, make_evidence, retrieve
+    settings = get_settings()
+    records = []
+    for fact in library_facts:
+        if not isinstance(fact, dict):
+            continue
+        fields = fact.get("fields") or []
+        text = "\n\n".join(
+            f"{field.get('name', '')}：{field.get('value', '')}"
+            if isinstance(field, dict) else str(field)
+            for field in fields
+        )
+        # records.py supplies facts already filtered by document_matches_company.
+        records.extend(
+            make_evidence(str(fact.get("fileId") or ""), chunk, matched=True,
+                          source="library", kind=str(fact.get("key") or ""), seq=seq)
+            for seq, chunk in enumerate(evidence_chunks(text), 1)
+        )
+    query = "；".join(lines)
+    hits = retrieve(query, records, limit=3, threshold=settings.evidence_score_threshold,
+                    requirement_kind="")
+    if hits:
+        lines.append(format_records(hits, budget=settings.evidence_section_budget))
+    else:
+        lines.append("\u3010\u5f85\u8865\u5145\u3011未检索到本卷要求对应的证据片段")
+    lines.append("仅 marker 内的内容可作为事实，其余一律不得补造数字与承诺")
+    return "\n".join(lines)
+
+
+def _parse(raw: str) -> dict:
+    text = (raw or "").lstrip("\ufeff \t\r\n")
+    try:
+        payload, _ = json.JSONDecoder().raw_decode(text)
+    except json.JSONDecodeError:
+        from api.services.layouts.parse import extract_json_object
+
+        try:
+            payload = extract_json_object(raw, prefer_keys=("clauses", "chapters"))
+        except AppError as exc:
+            if exc.status_code != 422:
+                raise
+            payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    # 缺哪部分就留空交给后续占位，不丢弃另一部分已返回的有效内容。
+    return {
+        key: payload[key] if isinstance(payload.get(key), list) else []
+        for key in ("clauses", "chapters")
+    }
+
+
+def _safe_response(
+    requirement: str, response: str, deviation: str, evidence: str
+) -> tuple[str, str]:
+    """Reject invented numbers and unsupported claims of qualification/performance."""
+    supplied_numbers = set(re.findall(r"\d+(?:\.\d+)?", requirement + evidence))
+    numbers = re.findall(r"\d+(?:\.\d+)?", response)
+    if any(n not in supplied_numbers for n in numbers):
+        return "\u3010\u5f85\u8865\u5145\u3011响应含未核实的金额或数量，请人工核对", "\u5f85\u786e\u8ba4"
+    needs_performance = "业绩" in requirement
+    needs_qualification = any(w in requirement for w in ("资质", "资格", "证书", "许可"))
+    if needs_performance and "用户选定业绩：" not in evidence and "资料库 perf" not in evidence:
+        return "\u3010\u5f85\u8865\u5145\u3011业绩证明尚未核实", "\u5f85\u786e\u8ba4"
+    if needs_qualification and "资料库 iso" not in evidence and "资料库 license" not in evidence:
+        return "\u3010\u5f85\u8865\u5145\u3011资格证明尚未核实", "\u5f85\u786e\u8ba4"
+    if any(word in requirement for word in ("价格", "报价金额")) and "用户报价：" not in evidence:
+        return "\u3010\u5f85\u8865\u5145\u3011报价事实尚未核实", "\u5f85\u786e\u8ba4"
+    if "优惠" in requirement and "用户商务补充说明：" not in evidence:
+        return "\u3010\u5f85\u8865\u5145\u3011优惠条件尚未核实", "\u5f85\u786e\u8ba4"
+    if not response or "\u3010\u5f85\u8865\u5145\u3011" in response or "\u5f85\u786e\u8ba4" in response:
+        return response or "\u3010\u5f85\u8865\u5145\u3011", "\u5f85\u786e\u8ba4"
+    return response, deviation if deviation in {
+        "无偏离",
+        "正偏离",
+        "负偏离",
+        "\u5f85\u786e\u8ba4",
+    } else "\u5f85\u786e\u8ba4"
+
+
+def _completeness_table(
+    substantial: list[BidRequirement], rows: list[DeviationLine]
+) -> tuple[str, int]:
+    from api.services.tenders.business_render import pending_summary, substantive_response
+
+    by_text = {re.sub(r"\s+", "", row.requirement): row for row in rows}
+    gaps = 0
+    for req in substantial:
+        row = by_text.get(re.sub(r"\s+", "", req.text))
+        if not row or not substantive_response(row.response) or row.deviation in {"负偏离", "\u5f85\u786e\u8ba4"}:
+            gaps += 1
+    if not substantial:
+        return "商务响应完整性核对表\n\u3010\u5f85\u8865\u5145\u3011未识别实质性商务条款，请核对招标商务章", 1
+    return "商务响应完整性核对表\n" + (pending_summary(gaps) if gaps else "实质性商务条款已响应，请核对证明材料。"), gaps
+
+
+def _response_text(rows: list[DeviationLine]) -> str:
+    from api.services.tenders.business_render import pending_summary, substantive_response
+
+    visible = [row for row in rows if substantive_response(row.response)]
+    lines = ["逐条商务响应"] if visible else []
+    for index, row in enumerate(visible, 1):
+        lines.append(f"{index}. {row.requirement}\n响应：{row.response}；偏离：{row.deviation or '\u5f85\u786e\u8ba4'}")
+    summary = pending_summary(len(rows) - len(visible))
+    if summary:
+        lines.append(summary)
+    return "\n".join(lines)
+
+
+async def draft_business_response(
+    db: AsyncSession,
+    brief: BidBrief,
+    *,
+    library_facts: list[dict] | None = None,
+    kb_ids: list[str] | None = None,
+    client=None,
+    recall=None,
+) -> tuple[BidBrief, list[str]]:
+    """Fill only existing, unedited business sections; preserve user-written rows."""
+    from api.services.tenders.business_draft_policy import (
+        business_contexts,
+        chapter_paragraphs,
+        protected_business_titles,
+    )
+
+    contexts = business_contexts(brief)
+    protected = protected_business_titles(brief, contexts)
+    if protected:
+        # Old record snapshots can still contain the earlier automatic expansion.
+        brief = brief.model_copy(update={"outlineItems": [
+            item.model_copy(update={"draftBody": "", "draftStatus": "empty"})
+            if item.title in protected and item.draftStatus == "drafted" else item
+            for item in brief.outlineItems
+        ]})
+    invitation = load_invitation_text(brief.invitationId)
+    requirements = business_requirements(brief, invitation)
+    substantial = _substantial_clauses(requirements)
+    scoring = _business_scores(brief, invitation)
+    sections = [i for i in brief.outlineItems if not i.skipped and _chapter_role(i)]
+    editable = [
+        i
+        for i in sections
+        if (i.draftStatus or "").lower() not in {"edited", "manual"}
+        and (not (i.draftBody or "").strip() or i.draftStatus == "drafted")
+        and i.title not in protected
+    ]
+    notes: list[str] = []
+    if protected:
+        notes.append("商务标：已保护原版固定承诺/声明，未自动扩写：" + "、".join(sorted(protected)))
+    if not invitation:
+        notes.append("商务标：邀请书正文为空，商务条款依据\u3010\u5f85\u8865\u5145\u3011；请重新识别邀请书")
+    roles = {_chapter_role(i) for i in sections}
+    for role, label in (
+        ("deviation", "商务偏离表"),
+        ("offer", "商务优惠及特殊承诺"),
+        ("commitment", "响应承诺正文"),
+    ):
+        if role not in roles:
+            notes.append(f"商务标：大纲无「{label}」对应章节，未擅自新增目录项")
+    if not editable:
+        return brief, [
+            *notes,
+            "商务标：没有可自动填写的商务响应章节，需核对的响应\u3010\u5f85\u8865\u5145\u3011；已保留人工内容和原大纲",
+        ]
+    if not requirements:
+        updated = [
+            item.model_copy(
+                update={
+                    "draftBody": (
+                        "商务响应完整性核对表\n\u3010\u5f85\u8865\u5145\u3011未识别可逐条响应的商务条款，请核对招标商务章"
+                    ),
+                    "draftStatus": "drafted",
+                }
+            )
+            if item in editable
+            else item
+            for item in brief.outlineItems
+        ]
+        pending_rows = brief.bizDeviationLines
+        if not pending_rows and any(_chapter_role(item) == "deviation" for item in editable):
+            pending_rows = [DeviationLine(
+                seq="1", requirement="\u3010\u5f85\u8865\u5145\u3011未识别可逐条响应的商务条款",
+                response="\u3010\u5f85\u8865\u5145\u3011请核对招标商务章", deviation="\u5f85\u786e\u8ba4",
+            )]
+        return brief.model_copy(update={"outlineItems": updated, "bizDeviationLines": pending_rows}), [
+            *notes,
+            "商务标：未提取到商务要求，已在核对表标\u3010\u5f85\u8865\u5145\u3011",
+        ]
+    evidence = _evidence(brief, library_facts or [])
+    selected_ids = [
+        str(x).strip()
+        for x in (kb_ids if kb_ids is not None else getattr(brief, "bizRespKbIds", []))
+        if str(x).strip()
+    ]
+    style = ""
+    if selected_ids:
+        if recall is None:
+            from api.services.tenders.extract import _recall_knowledge
+
+            recall = _recall_knowledge
+        from api.services.tenders.classifier import classify_procurement_type
+
+        kind = classify_procurement_type(invitation, [i.title for i in brief.outlineItems])
+        keywords = " ".join(r.text[:24] for r in requirements[:5])
+        score_words = " ".join(text[:24] for text, _weight in scoring[:3])
+        try:
+            docs, _ = await recall(
+                db,
+                invitation,
+                selected_ids,
+                query=f"{kind} 已中标 商务响应 商务偏离 承诺 {score_words} {keywords}"[:240],
+                quiet=True,
+                bidder_name=brief.bidderName,
+            )
+            style = _writing_style(await _won_business_docs(db, docs))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("business style recall skipped: %s", exc)
+    if style:
+        notes.append("商务标：已参考所选知识库的商务响应写法")
+    if client is None:
+        from api.services.models.runtime import build_llm_client
+
+        client = await build_llm_client(db, "pro")
+    titles = [i.title for i in editable]
+    by_req: dict[str, dict] = {}
+    body_parts: dict[str, list[str]] = {title: [] for title in titles}
+    chapter_candidates: dict[str, list[str]] = {title: [] for title in titles}
+    chapter_titles = {i.title for i in editable if _chapter_role(i) != "deviation"}
+    chapter_gaps: set[str] = set()
+    clause_gaps = False
+    async def generate_batch(offset):
+        batch = requirements[offset : offset + 20]
+        batch_texts = {row.text for row in batch}
+        batch_substantial = [row.text for row in batch if row in substantial]
+        return await complete_json(client,
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        get_prompt("biz_resp_system")
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": (
+                        "【用户商务输入，最高优先级】\n"
+                        + ((brief.extraNote or "").strip() or "（无）")
+                        + "\n【本批招标商务条款】\n"
+                        + "\n".join(f"{offset + n + 1}. {r.text}" for n, r in enumerate(batch))
+                        + "\n【本批实质条款清单，须逐条响应】\n"
+                        + ("\n".join(batch_substantial) or "（无）")
+                        + "\n【商务评分项与权重】\n"
+                        + (
+                            "\n".join(f"{text}（{weight}）" for text, weight in scoring)
+                            or "\u3010\u5f85\u8865\u5145\u3011未识别商务评分项"
+                        )
+                        + "\n【所选知识库写法参考，不可引用其项目事实】\n"
+                        + (style or "（无）")
+                        + "\n【已核实项目及资料库事实】\n"
+                        + evidence
+                        + "\n【仅允许填充的既有章节】\n"
+                        + "\n".join(titles)
+                        + "\n【上述章节原文及用途，仅在空缺处补充】\n"
+                        + "\n".join(f"{title}：{contexts.get(title, '')[:1200] or '空白响应章节'}"
+                                    for title in titles)
+                    ),
+                },
+            ],
+            mode="pro",
+        )
+    from api.services.tenders.generation_parallel import ordered_generation
+    offsets = list(range(0, len(requirements), 20))
+    results = await ordered_generation([lambda offset=offset: generate_batch(offset) for offset in offsets], stage='business_response')
+    for offset, raw in zip(offsets, results):
+        batch = requirements[offset:offset+20]
+        batch_texts = {row.text for row in batch}
+        batch_substantial = [row.text for row in batch if row in substantial]
+        payload = _parse(raw)
+        answered = set()
+        for row in payload["clauses"]:
+            if not isinstance(row, dict):
+                continue
+            key = str(row.get("requirement") or "").strip()
+            if key in batch_texts and key not in by_req:
+                by_req[key] = row
+                if str(row.get("response") or "").strip():
+                    answered.add(key)
+        if batch_texts - answered:
+            clause_gaps = True
+        returned_chapters = set()
+        for row in payload["chapters"]:
+            if not isinstance(row, dict):
+                continue
+            title = str(row.get("title") or "").strip()
+            body = str(row.get("body") or "").strip()
+            if title in body_parts and body:
+                # Keep only useful paragraphs, never model-generated pending clause copies.
+                parts = chapter_paragraphs(body)
+                body_parts[title].extend(part for part in parts if part not in body_parts[title])
+                if parts:
+                    candidate = "\n\n".join(parts)
+                    if candidate not in chapter_candidates[title]:
+                        chapter_candidates[title].append(candidate)
+                    returned_chapters.add(title)
+        chapter_gaps.update(chapter_titles - returned_chapters)
+    if clause_gaps:
+        notes.append("商务标：模型未完整返回逐条响应，缺失条款已标\u3010\u5f85\u8865\u5145\u3011，投标文件继续生成")
+    if chapter_gaps:
+        notes.append("商务标：模型未完整返回章节正文，缺失正文已标\u3010\u5f85\u8865\u5145\u3011，投标文件继续生成")
+        for title in chapter_gaps:
+            if not body_parts[title]:
+                body_parts[title].append("\u3010\u5f85\u8865\u5145\u3011商务响应章节正文未完整生成，请核对后补充。")
+    existing = {re.sub(r"\s+", "", d.requirement) for d in brief.bizDeviationLines}
+    rows = list(brief.bizDeviationLines)
+    for req in requirements:
+        if re.sub(r"\s+", "", req.text) in existing:
+            continue
+        answer = by_req.get(req.text) or {}
+        response_kind = classify_response(req.text, req.text)
+        if response_kind in {"declare", "declare_with_ref"} and not str(answer.get("response") or "").strip():
+            facts = {"项目名称": brief.projectName, "招标范围": brief.bidContent,
+                     "投标有效期": getattr(brief, "bidValidityDays", None), "工期": brief.deliveryDays,
+                     "质量标准": brief.quality}
+            answer["response"] = write_declaration(
+                req.text, req.text, facts, brief, chapter="", with_ref=response_kind == "declare_with_ref"
+            )
+            answer["deviation"] = "无偏离"
+        response, deviation = _safe_response(
+            req.text,
+            str(answer.get("response") or "").strip(),
+            str(answer.get("deviation") or "\u5f85\u786e\u8ba4").strip(),
+            evidence,
+        )
+        if response_kind in {"declare", "declare_with_ref"}:
+            check = validate_declaration(response, criterion_terms(req.text), {
+                "项目名称": brief.projectName, "招标范围": brief.bidContent,
+                "工期": brief.deliveryDays, "质量标准": brief.quality,
+            })
+            if not check["passed"]:
+                notes.append(f"商务评分项叙述质量待复核：{req.text}")
+        explanation = str(answer.get("explanation") or "").strip()
+        known_numbers = set(re.findall(r"\d+(?:\.\d+)?", req.text + evidence))
+        if not all(n in known_numbers for n in re.findall(r"\d+(?:\.\d+)?", explanation)):
+            explanation = "\u3010\u5f85\u8865\u5145\u3011说明包含未核实数量或金额"
+        rows.append(
+            DeviationLine(
+                seq=str(len(rows) + 1),
+                requirement=req.text,
+                response=response,
+                deviation=deviation,
+                explanation=explanation,
+            )
+        )
+    # Clauses are rendered once, in their evidence section or deviation/checklist table.
+    # Do not trust the model to obey the no-duplication instruction in chapter prose.
+    def clause_copy(part: str) -> bool:
+        text = re.sub(r"\s+", "", part)
+        for row in rows:
+            requirement = re.sub(r"\s+", "", row.requirement)
+            response = re.sub(r"\s+", "", row.response)
+            if requirement and requirement in text:
+                return True
+            if response and (response == text or (len(response) >= 8 and response in text)):
+                return True
+        return False
+
+    merge_titles = [title for title in titles
+                    if title in chapter_titles and len(chapter_candidates[title]) > 1]
+    if merge_titles and len(requirements) > 20:
+        # Clause batches are not successive paragraphs of a complete chapter.
+        # Compose one coherent result rather than concatenating their summaries.
+        raw = await complete_json(client, [
+            {"role": "system", "content": (
+                get_prompt("biz_resp_compose_system")
+            )},
+            {"role": "user", "content": (
+                "【已核实事实及用户商务输入】\n" + evidence
+                + "\n【章节用途与候选草稿】\n"
+                + json.dumps([{
+                    "title": title, "original": contexts.get(title, "")[:1200],
+                    "drafts": chapter_candidates[title],
+                } for title in merge_titles], ensure_ascii=False)[:20000]
+            )},
+        ], mode="pro")
+        composed = {}
+        for part in _parse(raw)["chapters"]:
+            if isinstance(part, dict) and part.get("title") in merge_titles:
+                clean = chapter_paragraphs(str(part.get("body") or ""))
+                if clean:
+                    composed.setdefault(part["title"], clean)
+        for title in merge_titles:
+            # A malformed merge must not recreate the original concatenation bug.
+            body_parts[title] = composed.get(title) or chapter_paragraphs(chapter_candidates[title][0])
+        notes.append(
+            "商务标：分批草稿已按章节统一整理"
+            if len(composed) == len(merge_titles)
+            else "商务标：部分章节统稿未完成，已保留首份有效草稿，请核对后补充"
+        )
+    bodies = {
+        title: "\n\n".join(part for part in parts if not clause_copy(part))
+        for title, parts in body_parts.items()
+    }
+    _, gap_count = _completeness_table(substantial, rows)
+    if gap_count:
+        notes.append(f"商务标：{gap_count} 条实质性条款待补充或存在偏离，已在核对表标出")
+    updated = []
+    for item in brief.outlineItems:
+        body = bodies.get(item.title, "")
+        if item in editable and _chapter_role(item) != "deviation":
+            if not body:
+                body = "\u3010\u5f85\u8865\u5145\u3011本章节正文尚未生成，请核对后补充。"
+            if body and _chapter_role(item) == "offer" and not (brief.extraNote or "").strip():
+                body = "\u3010\u5f85\u8865\u5145\u3011未提供可核实的商务优惠条件或特殊承诺。"
+            known_numbers = set(re.findall(r"\d+(?:\.\d+)?", invitation + evidence))
+            safe_numbers = all(n in known_numbers for n in re.findall(r"\d+(?:\.\d+)?", body))
+            if not safe_numbers:
+                body = "\u3010\u5f85\u8865\u5145\u3011正文包含未核实数量或金额，请人工核对。"
+            updated.append(
+                item.model_copy(update={"draftBody": body, "draftStatus": "drafted"})
+                if body
+                else item
+            )
+        else:
+            updated.append(item)
+    headers = brief.bizDevHeaders or (
+        ["招标条款", "响应", "偏离", "说明"]
+        if any(_chapter_role(i) == "deviation" and not (i.body or "").strip() for i in sections)
+        else []
+    )
+    return brief.model_copy(
+        update={"outlineItems": updated, "bizDeviationLines": rows, "bizDevHeaders": headers}
+    ), [
+        *notes,
+        f"商务标：已对照 {len(rows)} 条商务要求起草响应",
+    ]
+
+
+

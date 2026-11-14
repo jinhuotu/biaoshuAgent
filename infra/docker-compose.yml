@@ -1,0 +1,115 @@
+# 本地依赖：MySQL + Redis + Qdrant + OnlyOffice + Whisper ASR。
+# 对话归档 Worker 用 poetry 起，不强制容器化。
+#
+# 宿主机端口刻意避开 zhongjiAgent 的 deploy 栈（3306 / 16379 / 6333 / 6334）。
+# 容器内部端口仍用官方默认值。
+services:
+  mysql:
+    image: mysql:8.0
+    container_name: weitai-mysql
+    restart: unless-stopped
+    environment:
+      # MYSQL_USER 不能是 root（官方镜像会直接退出）。root 密码用 MYSQL_ROOT_PASSWORD。
+      MYSQL_ROOT_PASSWORD: admin
+      MYSQL_DATABASE: weitai_agent
+      MYSQL_USER: weitai
+      MYSQL_PASSWORD: weitai_dev
+    ports:
+      - "13306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uroot", "-padmin"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: weitai-redis
+    restart: unless-stopped
+    # 宿主机 26379，避开 zhongji 的 16379 与本机默认 6379；容器内仍为 6379
+    ports:
+      - "26379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+
+  qdrant:
+    image: qdrant/qdrant:v1.12.5
+    container_name: weitai-qdrant
+    restart: unless-stopped
+    ports:
+      - "16333:6333"   # HTTP / Dashboard
+      - "16334:6334"   # gRPC
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/6333'"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # OnlyOffice Document Server：非信创环境的在线 Word 编辑（浏览器连 8082）。
+  # 国产/信创请改用永中 Web Office（TENDER_DOC_PREVIEW=yozo），不要依赖本服务。
+  onlyoffice:
+    image: onlyoffice/documentserver:8.2.2
+    container_name: weitai-onlyoffice
+    restart: unless-stopped
+    # 打满只重启本容器。不封顶时 WSL 会崩，并把内存转储写满 C 盘。
+    mem_limit: 4g
+    memswap_limit: 4g
+    ports:
+      - "8082:80"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      JWT_ENABLED: "true"
+      JWT_SECRET: onlyoffice-dev-secret-change-me
+      # 文档服务要来拉本机 API 上的 docx。默认拒绝私网地址，不放开就会「下载失败」。
+      ALLOW_PRIVATE_IP_ADDRESS: "true"
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+    volumes:
+      - onlyoffice_data:/var/www/onlyoffice/Data
+      - onlyoffice_logs:/var/log/onlyoffice
+      # 中文字体（宋体等）。缺字时预览会用西文替代，同一段在 Word 一页、预览却翻到下一页。
+      # Windows 可先运行 infra/sync-onlyoffice-fonts.ps1 拷入 onlyoffice-fonts。
+      - ./onlyoffice-fonts:/usr/share/fonts/truetype/custom:ro
+
+  # 知识库视频 ASR（OpenAI 兼容 /v1/audio/transcriptions）。
+  # 宿主机 19000 → 容器 9000；API 侧 ASR_API_BASE=http://127.0.0.1:19000/v1
+  whisper:
+    image: hwdsl2/whisper-server:latest
+    container_name: weitai-whisper
+    restart: unless-stopped
+    ports:
+      - "19000:9000"
+    environment:
+      WHISPER_MODEL: base
+      WHISPER_LANGUAGE: zh
+      WHISPER_DEVICE: cpu
+      WHISPER_COMPUTE_TYPE: int8
+      WHISPER_THREADS: "4"
+      # 固定本地开发密钥，避免镜像自动生成导致 API 对不上
+      WHISPER_API_KEY: weitai-dev-whisper
+    volumes:
+      - whisper_data:/var/lib/whisper
+
+volumes:
+  mysql_data:
+  redis_data:
+  qdrant_data:
+  onlyoffice_data:
+  onlyoffice_logs:
+  whisper_data:
