@@ -9,26 +9,11 @@ from pathlib import Path
 
 from api.services.tenders.quote import _q
 from api.services.tenders.tables import quote_role
+from api.services.quotes.packs import QuotePack, load_pack
 
 _TWO = Decimal("0.01")
 _SKIP = ("不含税合计", "含税合计", "税率", "合计", "小计", "总计", "备注")
 _TOKEN = re.compile(r"[a-z0-9]+|[\u4e00-\u9fff]+", re.I)
-_KW_RE = re.compile(r"(\d+(?:\.\d+)?)kw", re.I)
-_KVA_RE = re.compile(r"(\d+(?:\.\d+)?)kva", re.I)
-
-CODE_HINTS: dict[str, tuple[str, ...]] = {
-    "dc_320kw": ("320kw", "320千瓦", "400kw", "直流320", "320kW直流"),
-    "dc_160kw": ("160kw", "160千瓦", "直流160", "160kW直流"),
-    "dc_120kw": ("120kw", "120千瓦", "直流120", "120kW直流"),
-    "ac_14kw": ("14kw", "14千瓦", "交流14", "交流桩"),
-    "box_transformer": ("箱变", "箱式变压", "箱式变", "变电站"),
-    "ring_cabinet": ("环网柜", "环网箱"),
-    "lv_cabinet": ("低压柜", "低压配电"),
-    "group_host": ("群充", "主机"),
-    "cable": ("电缆", "铜芯"),
-    "trench": ("电缆沟", "沟槽"),
-    "foundation": ("基础", "基座"),
-}
 
 
 @dataclass(frozen=True)
@@ -44,7 +29,7 @@ class CatalogItem:
     scene: str = ""
 
 
-def parse_catalog_xlsx(path: Path) -> list[CatalogItem]:
+def parse_catalog_xlsx(path: Path, *, pack_id: str = "default_charger") -> list[CatalogItem]:
     from openpyxl import load_workbook
 
     # 不用 read_only：不少价目表 dimension 仍是 A1，只读模式会整表丢行
@@ -52,13 +37,13 @@ def parse_catalog_xlsx(path: Path) -> list[CatalogItem]:
     try:
         rows: list[CatalogItem] = []
         for ws in wb.worksheets:
-            rows.extend(_sheet_items(ws, path.name))
+            rows.extend(_sheet_items(ws, path.name, load_pack(pack_id)))
         return rows
     finally:
         wb.close()
 
 
-def _sheet_items(ws, source: str) -> list[CatalogItem]:
+def _sheet_items(ws, source: str, pack: QuotePack) -> list[CatalogItem]:
     mapping: dict[str, int] | None = None
     out: list[CatalogItem] = []
     for row in ws.iter_rows(values_only=True):
@@ -66,7 +51,7 @@ def _sheet_items(ws, source: str) -> list[CatalogItem]:
         if mapping is None:
             mapping = _header_map(cells)
             continue
-        item = _row_item(cells, mapping, source)
+        item = _row_item(cells, mapping, source, pack)
         if item is not None:
             out.append(item)
     return out
@@ -97,12 +82,12 @@ def _txt(value: object) -> str:
     return str(value).replace("\r\n", "\n").strip()
 
 
-def _row_item(cells: list[object], mapping: dict[str, int], source: str) -> CatalogItem | None:
+def _row_item(cells: list[object], mapping: dict[str, int], source: str, pack: QuotePack) -> CatalogItem | None:
     name = _txt(_cell(cells, mapping.get("name")))
     if not name or any(k in name for k in _SKIP):
         return None
     spec = _txt(_cell(cells, mapping.get("spec")))
-    unit = _txt(_cell(cells, mapping.get("unit"))) or "项"
+    unit = pack.normalize_unit(_cell(cells, mapping.get("unit"))) or pack.fallback_unit()
     price = _q(_cell(cells, mapping.get("price")))
     cost = _q(_cell(cells, mapping.get("cost_price")))
     sell = _q(_cell(cells, mapping.get("sell_price")))
@@ -130,14 +115,14 @@ def _row_item(cells: list[object], mapping: dict[str, int], source: str) -> Cata
 OFFICIAL_SCORE = 0.7
 
 
-def load_catalog(paths: list[Path]) -> tuple[list[CatalogItem], list[str]]:
+def load_catalog(paths: list[Path], *, pack_id: str = "default_charger") -> tuple[list[CatalogItem], list[str]]:
     items: list[CatalogItem] = []
     errors: list[str] = []
     for path in paths:
         if path.suffix.lower() not in {".xlsx", ".xlsm"}:
             continue
         try:
-            rows = parse_catalog_xlsx(path)
+            rows = parse_catalog_xlsx(path, pack_id=pack_id)
         except Exception as exc:
             errors.append(f"价目文件「{path.name}」无法解析：{exc}")
             continue
@@ -156,27 +141,42 @@ def _tokens(text: str) -> set[str]:
     return {m.group(0).lower() for m in _TOKEN.finditer(text or "") if len(m.group(0)) >= 2}
 
 
-def _ratings(text: str, pat: re.Pattern[str]) -> set[float]:
-    return {float(x) for x in pat.findall(_norm(text))}
+def _spec_values(text: str, pack: QuotePack) -> dict[str, set[Decimal]]:
+    values: dict[str, set[Decimal]] = {}
+    normalized = _norm(text)
+    for pattern in pack.spec_patterns:
+        try:
+            matches = re.findall(pattern.regex, normalized, re.IGNORECASE)
+        except re.error:
+            continue
+        extracted: set[Decimal] = set()
+        for match in matches:
+            value = match[0] if isinstance(match, tuple) else match
+            try:
+                extracted.add(Decimal(str(value)))
+            except Exception:
+                continue
+        if extracted:
+            values[pattern.key] = extracted
+    return values
 
 
-def _rating_conflict(query: str, item: CatalogItem) -> bool:
+def _rating_conflict(query: str, item: CatalogItem, pack: QuotePack) -> bool:
     blob = f"{item.category} {item.name} {item.spec}"
-    qkw, bkw = _ratings(query, _KW_RE), _ratings(blob, _KW_RE)
-    if qkw and bkw and qkw.isdisjoint(bkw):
-        return True
-    qkva, bkva = _ratings(query, _KVA_RE), _ratings(blob, _KVA_RE)
-    return bool(qkva and bkva and qkva.isdisjoint(bkva))
+    query_values = _spec_values(query, pack)
+    item_values = _spec_values(blob, pack)
+    return any(query_values.get(key) and item_values.get(key) and query_values[key].isdisjoint(item_values[key]) for key in query_values)
 
 
-def match_score(query: str, code: str, item: CatalogItem) -> float:
+def match_score(query: str, code: str, item: CatalogItem, *, pack_id: str = "default_charger", pack: QuotePack | None = None) -> float:
+    pack = pack or load_pack(pack_id)
     blob = f"{item.category} {item.name} {item.spec}"
     name_blob = f"{item.category} {item.name}"
     qn = _norm(query)
     bn = _norm(blob)
     if not qn or not bn:
         return 0.0
-    if _rating_conflict(query, item):
+    if _rating_conflict(query, item, pack):
         return 0.0
     score = 0.0
     if qn == bn:
@@ -189,7 +189,7 @@ def match_score(query: str, code: str, item: CatalogItem) -> float:
         if qt and bt:
             score = len(qt & bt) / max(len(qt), 1)
     bn_name = _norm(name_blob)
-    for hint in CODE_HINTS.get((code or "").strip().lower(), ()):
+    for hint in pack.synonyms.get((code or "").strip().lower(), ()):
         if _norm(hint) and _norm(hint) in bn_name:
             score = max(score, 0.78)
     return score
@@ -210,11 +210,13 @@ def list_catalog_hits(
     code: str,
     catalog: list[CatalogItem],
     limit: int = 8,
+    pack_id: str = "default_charger",
 ) -> list[dict]:
+    pack = load_pack(pack_id)
     query = f"{name} {spec}".strip()
     scored: list[tuple[float, CatalogItem]] = []
     for item in catalog:
-        s = match_score(query, code, item)
+        s = match_score(query, code, item, pack=pack)
         if s < 0.25:
             continue
         scored.append((s, item))
@@ -245,12 +247,14 @@ def pick_catalog(
     spec: str,
     code: str,
     catalog: list[CatalogItem],
+    pack_id: str = "default_charger",
 ) -> tuple[CatalogItem | None, float]:
+    pack = load_pack(pack_id)
     query = f"{name} {spec}".strip()
     passed: list[tuple[float, CatalogItem]] = []
     best_s = 0.0
     for item in catalog:
-        s = match_score(query, code, item)
+        s = match_score(query, code, item, pack=pack)
         if s < 0.42:
             continue
         passed.append((s, item))
@@ -258,25 +262,16 @@ def pick_catalog(
             best_s = s
     if not passed:
         return None, best_s
-    qkw = _ratings(query, _KW_RE)
-    qkva = _ratings(query, _KVA_RE)
+    query_values = _spec_values(query, pack)
     same = passed
-    if qkw:
-        kw_hit = [
+    for key, values in query_values.items():
+        pattern_hit = [
             (s, it)
             for s, it in passed
-            if qkw & _ratings(f"{it.category} {it.name} {it.spec}", _KW_RE)
+            if values & _spec_values(f"{it.category} {it.name} {it.spec}", pack).get(key, set())
         ]
-        if kw_hit:
-            same = kw_hit
-    elif qkva:
-        kva_hit = [
-            (s, it)
-            for s, it in passed
-            if qkva & _ratings(f"{it.category} {it.name} {it.spec}", _KVA_RE)
-        ]
-        if kva_hit:
-            same = kva_hit
+        if pattern_hit:
+            same = pattern_hit
     same.sort(key=lambda x: x[0], reverse=True)
     hit = same[0][1]
     rich = max(same, key=lambda x: _spec_rank(x[1]))[1]

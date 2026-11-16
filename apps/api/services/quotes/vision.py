@@ -1,4 +1,4 @@
-"""读场地规划图，抽出充电桩/配套设备工程量。"""
+"""读规划图或工程图，抽取通用工程量。"""
 
 from __future__ import annotations
 
@@ -30,20 +30,20 @@ _ALLOWED = {
     ".pdf",
 }
 
-_PROMPT = """你是充电站造价助理。根据场地规划图提取工程量，只输出 JSON，不要Markdown说明。
+_PROMPT = """你是工程量清单识别助手。根据规划图、平面图或工程图提取所有能确认的工程量，只输出 JSON，不要 Markdown 说明。
 规则：
-- 桩型 code 只能是 dc_320kw / dc_160kw / dc_120kw / ac_14kw
-- 设备 code 可用 box_transformer / ring_cabinet / lv_cabinet / group_host / fire_hydrant
-- 多张图/多页 PDF 视为同一项目，同类工程量合计，不要把同一批桩重复计数
-- 图上看不清的数量不要编，放进 uncertainties
+- 不预设行业、产品或设备型号，按图例和标注原样填写名称、规格、单位和数量
+- 多张图或多页 PDF 视为同一项目，同一对象只有在证据明确属于同一批时才合计
+- 看不清、数量不完整或无法判断的内容保留到 uncertainties，不要猜测
 - 不要填写单价
 JSON 形状：
 {
-  "projectName": "项目名或空",
-  "chargers": [{"code":"dc_160kw","name":"160kW直流充电桩","qty":8,"note":"图例/车位"}],
-  "equipment": [{"code":"box_transformer","name":"箱变","qty":1,"specHint":"","note":""}],
-  "extras": [{"name":"雨棚","qty":1,"unit":"项","note":"图上有雨棚"}],
-  "uncertainties": ["……"]
+  "docKind":"drawing",
+  "projectName":"项目名或空",
+  "items":[{"name":"","spec":"","unit":"","qty":0,"group":"","note":""}],
+  "legend":[],
+  "uncertainties":[],
+  "industryHint":""
 }
 """
 

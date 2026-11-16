@@ -89,7 +89,13 @@ packages = ["common", "db", "api"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-testpaths = ["tests"]
+# 服务包内自带的回归用例（原先不在任何收集范围内，约 287 条）
+testpaths = [
+    "tests",
+    "apps/api/services/tender_package",
+    "apps/api/services/cablepkg/tests",
+    "apps/api/services/bidgen/tests",
+]
 pythonpath = ["apps", "packages"]
 
 # Cursor / Pylance：与运行时 PYTHONPATH 对齐（顶层包是 api / common / db，不在仓库根目录）

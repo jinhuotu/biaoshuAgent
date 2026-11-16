@@ -1,0 +1,82 @@
+{
+  "id": "default_charger",
+  "name": "充电设施",
+  "units": ["台", "套", "米", "座", "处", "项"],
+  "unitAliases": {
+    "台": "台",
+    "台套": "套",
+    "平方米": "m2",
+    "平米": "m2"
+  },
+  "synonyms": {
+    "dc_320kw": ["320kW直流充电桩", "直流320"],
+    "dc_160kw": ["160kW直流充电桩", "直流160"],
+    "dc_120kw": ["120kW直流充电桩", "直流120"],
+    "ac_14kw": ["14kW交流充电桩", "交流14", "交流桩"],
+    "box_transformer": ["箱式变压器", "箱变", "箱式变电站", "变电站"],
+    "ring_cabinet": ["环网柜", "环网箱"],
+    "lv_cabinet": ["低压配电柜", "低压柜", "低压配电"],
+    "group_host": ["群充主机", "群充", "主机"],
+    "fire_hydrant": ["消火栓"],
+    "cable_well": ["电缆井"],
+    "cable": ["电缆", "铜芯"],
+    "trench": ["电缆沟", "沟槽"],
+    "foundation": ["充电桩基础", "基础", "基座"]
+  },
+  "specPatterns": [
+    {
+      "key": "power",
+      "regex": "(\\d+(?:\\.\\d+)?)\\s*(?:kw|千瓦)",
+      "normalize": "kw"
+    },
+    {
+      "key": "capacity",
+      "regex": "(\\d+(?:\\.\\d+)?)\\s*(?:kva|千伏安)",
+      "normalize": "kva"
+    }
+  ],
+  "quantityRules": [
+    {
+      "item": "充电桩基础",
+      "per": ["台"],
+      "factor": 1,
+      "note": "按桩台数估算",
+      "codes": ["dc_320kw", "dc_160kw", "dc_120kw", "ac_14kw"]
+    }
+  ],
+  "feeDefaults": {
+    "measureRate": 0.03,
+    "manageRate": 0.05,
+    "profitRate": 0.08,
+    "taxRate": 0.13,
+    "contingencyRate": 0.03,
+    "laborCoef": 0,
+    "budgetCoef": 1.05,
+    "laborRate": 0.2,
+    "materialRate": 0.7,
+    "machineRate": 0.1
+  },
+  "columns": ["序号", "名称", "规格型号", "单位", "数量", "单价", "合价", "备注"],
+  "outputTitles": {
+    "sheet": "报价单",
+    "cost": "造价测算表",
+    "budget": "控制预算表",
+    "summary": "费用汇总",
+    "note": "编制说明"
+  },
+  "unitByCode": {
+    "dc_320kw": "台",
+    "dc_160kw": "台",
+    "dc_120kw": "台",
+    "ac_14kw": "台",
+    "box_transformer": "台",
+    "ring_cabinet": "台",
+    "lv_cabinet": "台",
+    "group_host": "台",
+    "fire_hydrant": "套",
+    "cable_well": "座",
+    "cable": "米",
+    "trench": "米",
+    "foundation": "处"
+  }
+}

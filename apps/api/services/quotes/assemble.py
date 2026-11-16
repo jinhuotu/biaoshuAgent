@@ -13,25 +13,7 @@ from api.services.quotes.catalog import (
     pick_catalog,
 )
 from api.services.quotes.library import stored_paths
-
-_CHARGER = {
-    "dc_320kw": ("320kW直流充电桩", "台"),
-    "dc_160kw": ("160kW直流充电桩", "台"),
-    "dc_120kw": ("120kW直流充电桩", "台"),
-    "ac_14kw": ("14kW交流充电桩", "台"),
-}
-_EQUIP = {
-    **{k: (v[0], v[1]) for k, v in _CHARGER.items()},
-    "box_transformer": ("箱式变压器", "台"),
-    "ring_cabinet": ("环网柜", "台"),
-    "lv_cabinet": ("低压配电柜", "台"),
-    "group_host": ("群充主机", "台"),
-    "fire_hydrant": ("消火栓", "套"),
-    "cable_well": ("电缆井", "座"),
-    "cable": ("电缆", "米"),
-    "trench": ("电缆沟", "米"),
-    "foundation": ("充电桩基础", "处"),
-}
+from api.services.quotes.packs import load_pack
 
 
 def _qty(raw: object) -> Decimal:
@@ -68,21 +50,52 @@ def empty_line(**kwargs: Any) -> dict[str, Any]:
     return row
 
 
-def flatten_bom(data: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str]]:
+def flatten_bom(data: dict[str, Any], *, pack_id: str = "default_charger") -> tuple[list[dict[str, Any]], list[str]]:
+    pack = load_pack(pack_id)
     warnings = [_txt(x) for x in (data.get("uncertainties") or []) if _txt(x)]
     lines: list[dict[str, Any]] = []
-    charger_qty = Decimal("0")
+    rule_sources: dict[str, Decimal] = {}
 
-    for row in data.get("chargers") or []:
+    def resolved(row: dict[str, Any], code: str, fallback_name: str = "") -> tuple[str, str, str]:
+        name = _txt(row.get("name")) or pack.display_name(code, fallback_name or code or "设备")
+        unit = pack.normalize_unit(row.get("unit"))
+        if not unit:
+            unit = pack.normalize_unit(pack.unit_by_code.get(code)) or pack.fallback_unit()
+        note = _txt(row.get("note"))
+        if not _txt(row.get("unit")) and not pack.unit_by_code.get(code):
+            note = f"{note}；单位待确认" if note else "单位待确认"
+        return name, unit, note
+
+    generic_items = data.get("items") or []
+    for row in generic_items:
+        if not isinstance(row, dict):
+            continue
+        name, unit, note = resolved(row, _txt(row.get("code")), "待确认项")
+        qty = _qty(row.get("qty"))
+        if _txt(row.get("code")):
+            rule_sources[_txt(row.get("code")).lower()] = rule_sources.get(_txt(row.get("code")).lower(), Decimal("0")) + qty
+        lines.append(
+            empty_line(
+                seq=_txt(row.get("seq")),
+                code=_txt(row.get("code")),
+                name=name,
+                spec=_txt(row.get("spec") or row.get("specHint")),
+                unit=unit,
+                qty=qty,
+                source="vision",
+                note=note,
+            )
+        )
+
+    for row in ([] if generic_items else data.get("chargers")) or []:
         if not isinstance(row, dict):
             continue
         code = _txt(row.get("code")).lower()
         qty = _qty(row.get("qty"))
         if qty <= 0:
             continue
-        title, unit = _CHARGER.get(code, (_txt(row.get("name")) or "充电桩", "台"))
-        name = _txt(row.get("name")) or title
-        charger_qty += qty
+        name, unit, note = resolved(row, code)
+        rule_sources[code] = rule_sources.get(code, Decimal("0")) + qty
         lines.append(
             empty_line(
                 code=code or "charger",
@@ -91,19 +104,18 @@ def flatten_bom(data: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str]]:
                 unit=unit,
                 qty=qty,
                 source="vision",
-                note=_txt(row.get("note")),
+                note=note,
             )
         )
 
-    for row in data.get("equipment") or []:
+    for row in ([] if generic_items else data.get("equipment")) or []:
         if not isinstance(row, dict):
             continue
         code = _txt(row.get("code")).lower()
         qty = _qty(row.get("qty"))
         if qty <= 0:
             continue
-        title, unit = _EQUIP.get(code, (_txt(row.get("name")) or code or "设备", "项"))
-        name = _txt(row.get("name")) or title
+        name, unit, note = resolved(row, code)
         lines.append(
             empty_line(
                 code=code,
@@ -112,48 +124,65 @@ def flatten_bom(data: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str]]:
                 unit=unit,
                 qty=qty,
                 source="vision",
-                note=_txt(row.get("note")),
+                note=note,
             )
         )
 
-    extras_names = []
-    for row in data.get("extras") or []:
+    for row in ([] if generic_items else data.get("extras")) or []:
         if not isinstance(row, dict):
             continue
         name = _txt(row.get("name"))
         qty = _qty(row.get("qty"))
         if not name or qty <= 0:
             continue
-        extras_names.append(name)
         lines.append(
             empty_line(
                 name=name,
                 spec=_txt(row.get("specHint") or row.get("spec")),
-                unit=_txt(row.get("unit")) or "项",
+                unit=pack.normalize_unit(row.get("unit")) or pack.fallback_unit(),
                 qty=qty,
                 source="vision",
-                note=_txt(row.get("note")),
+                note=(
+                    f"{_txt(row.get('note'))}；单位待确认"
+                    if not _txt(row.get("unit")) and _txt(row.get("note"))
+                    else ("单位待确认" if not _txt(row.get("unit")) else _txt(row.get("note")))
+                ),
             )
         )
 
-    if charger_qty > 0 and not any("基础" in n for n in extras_names):
+    existing_names = {_txt(row.get("name")) for row in lines}
+    for rule in pack.quantity_rules:
+        if rule.item in existing_names:
+            continue
+        source_qty = Decimal("0")
+        if rule.codes:
+            source_qty = sum((rule_sources.get(code.lower(), Decimal("0")) for code in rule.codes), Decimal("0"))
+        else:
+            source_qty = sum(
+                (_qty(row.get("qty")) for row in lines if _txt(row.get("unit")) in {pack.normalize_unit(x) for x in rule.per}),
+                Decimal("0"),
+            )
+        qty = source_qty * rule.factor
+        if qty <= 0:
+            continue
+        rule_code = next((code for code, aliases in pack.synonyms.items() if aliases and aliases[0] == rule.item), "")
         lines.append(
             empty_line(
-                code="foundation",
-                name="充电桩基础",
-                unit="处",
-                qty=charger_qty,
+                code=rule_code,
+                name=rule.item,
+                unit=pack.unit_by_code.get(rule_code, pack.fallback_unit()),
+                qty=qty,
                 source="rule",
-                note="按桩台数估算，请核对",
+                note=rule.note or "单位待确认",
             )
         )
 
     if not lines:
-        warnings.append("未从图中识别到充电桩或设备，请补充说明或改用更清晰的图纸")
+        warnings.append("未识别到可用工程量，请补充说明或改用更清晰的资料")
     return lines, warnings
 
 
-def apply_catalog(lines: list[dict[str, Any]], catalog: list[CatalogItem]) -> list[str]:
+def apply_catalog(lines: list[dict[str, Any]], catalog: list[CatalogItem], *, pack_id: str = "default_charger") -> list[str]:
     notes: list[str] = []
     if not catalog:
         notes.append("所选知识库没有可用价目 Excel（需含名称、单价列），单价留空待核价")
@@ -166,6 +195,7 @@ def apply_catalog(lines: list[dict[str, Any]], catalog: list[CatalogItem]) -> li
             spec=str(row.get("spec") or ""),
             code=str(row.get("code") or ""),
             catalog=catalog,
+            pack_id=pack_id,
         )
         row["matchScore"] = round(float(score or 0), 3)
         if hit is None:
@@ -231,9 +261,9 @@ def number_lines(lines: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return out
 
 
-def catalog_from_docs(docs: list[dict]) -> tuple[list[CatalogItem], list[str], dict[str, Any]]:
+def catalog_from_docs(docs: list[dict], *, pack_id: str = "default_charger") -> tuple[list[CatalogItem], list[str], dict[str, Any]]:
     paths = stored_paths(docs)
-    items, errors = load_catalog(paths)
+    items, errors = load_catalog(paths, pack_id=pack_id)
     meta = {
         "fileCount": len(paths),
         "itemCount": len(items),
@@ -268,11 +298,12 @@ async def recognize_from_bom(
     data: dict[str, Any],
     docs: list[dict],
     project_name: str = "",
+    pack_id: str = "default_charger",
 ) -> dict[str, Any]:
-    lines, warnings = flatten_bom(data)
-    catalog, cat_err, meta = catalog_from_docs(docs)
+    lines, warnings = flatten_bom(data, pack_id=pack_id)
+    catalog, cat_err, meta = catalog_from_docs(docs, pack_id=pack_id)
     warnings.extend(cat_err)
-    warnings.extend(apply_catalog(lines, catalog))
+    warnings.extend(apply_catalog(lines, catalog, pack_id=pack_id))
     lines = number_lines(lines)
     unmatched = pending_price_count(lines)
     title = (project_name or "").strip() or _txt(data.get("projectName"))

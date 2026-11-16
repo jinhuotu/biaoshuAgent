@@ -24,6 +24,34 @@ class QuoteLineIn(BaseModel):
     note: str = ""
 
 
+class IngestLine(BaseModel):
+    seq: str = ""
+    group_path: list[str] = Field(default_factory=list)
+    code: str = ""
+    name: str = ""
+    spec: str = ""
+    unit: str = ""
+    qty: Decimal = Decimal("0")
+    unit_price: Decimal = Decimal("0")
+    cost_price: Decimal = Decimal("0")
+    amount: Decimal = Decimal("0")
+    source: str = "manual"
+    evidence: dict[str, Any] = Field(default_factory=dict)
+    confidence: float = 1.0
+    status: str = "confirmed"
+    notes: list[str] = Field(default_factory=list)
+
+
+class IngestResult(BaseModel):
+    stage: str = "parsed"
+    projectName: str = ""
+    projectNameInferred: bool = False
+    lines: list[IngestLine] = Field(default_factory=list)
+    quality: dict[str, Any] = Field(default_factory=dict)
+    counts: dict[str, Any] = Field(default_factory=dict)
+    warnings: list[str] = Field(default_factory=list)
+
+
 class QuoteRatesIn(BaseModel):
     laborCoef: Decimal = Field(Decimal("0"), ge=0)
     measureRate: Decimal = Field(Decimal("0.03"), ge=0, le=1)
@@ -46,6 +74,8 @@ class GenerateQuoteIn(BaseModel):
     taxRate: Decimal = Field(Decimal("0.13"), ge=0, le=1)
     baseId: str = Field("", max_length=32)
     baseName: str = Field("", max_length=128)
+    packId: str = Field("default_charger", max_length=64)
+    costingModel: Literal["cost_plus", "market_down", "quota"] = "cost_plus"
     rates: QuoteRatesIn | None = None
     applyVerifyFixes: bool = False
     schemeName: str = Field("", max_length=32)
@@ -56,6 +86,7 @@ class GenerateQuoteIn(BaseModel):
 class VerifyQuoteIn(BaseModel):
     lines: list[QuoteLineIn] = Field(default_factory=list)
     applyFixes: bool = False
+    packId: str = Field("default_charger", max_length=64)
 
 
 class CostQuoteIn(BaseModel):
@@ -68,6 +99,10 @@ class CostQuoteIn(BaseModel):
     bidCeiling: Decimal | None = Field(None, ge=0)
     competition: Literal["conservative", "balanced", "aggressive"] = "balanced"
     targetMargin: Decimal | None = Field(None, ge=0, le=1)
+    packId: str = Field("default_charger", max_length=64)
+    costingModel: Literal["cost_plus", "market_down", "quota"] = "cost_plus"
+    referenceTotal: Decimal | None = Field(None, ge=0)
+    downRate: Decimal | None = Field(None, ge=0, le=1)
 
 
 class CatalogCandidatesIn(BaseModel):
@@ -76,3 +111,4 @@ class CatalogCandidatesIn(BaseModel):
     spec: str = Field("", max_length=2000)
     code: str = Field("", max_length=64)
     limit: int = Field(8, ge=1, le=20)
+    packId: str = Field("default_charger", max_length=64)

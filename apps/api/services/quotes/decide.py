@@ -31,6 +31,8 @@ def build_schemes(
     project_name: str,
     location: str,
     duration_days: float | None,
+    lines: list[dict[str, Any]] | None = None,
+    quality: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], str, list[str]]:
     key = (competition or "balanced").strip().lower()
     if key not in _COMPETE:
@@ -51,6 +53,25 @@ def build_schemes(
         ("进取方案", Decimal("0.92"), "偏低报价抢标，需严控成本与变更"),
     ]
     risks: list[str] = []
+    quality = quality or {}
+    risk_codes: set[str] = set()
+    if int(quality.get("pendingCount") or 0) > 0 or any(_q(row.get("sellPrice") or row.get("unitPrice")) <= 0 for row in (lines or [])):
+        risk_codes.add("pending_price")
+    unbalanced: dict[str, Any] = {"detected": False, "suggestion": ""}
+    if lines:
+        early = Decimal("0")
+        late = Decimal("0")
+        for row in lines:
+            amount = _q(row.get("amount"))
+            if amount <= 0:
+                amount = _q(row.get("sellPrice") or row.get("unitPrice")) * _q(row.get("qty") or 1)
+            groups = " / ".join(str(x) for x in (row.get("group_path") or row.get("groupPath") or []))
+            if any(word in groups for word in ("措施", "临建", "进场")):
+                early += amount
+            else:
+                late += amount
+        if early > late and late > 0:
+            unbalanced = {"detected": True, "suggestion": "前期项占比偏高，建议复核前期与后期项目的报价分配，仅作建议不自动改价"}
     for name, c, tip in presets:
         ex = (base * c).quantize(_TWO, rounding=ROUND_HALF_UP)
         if cost_ex > 0:
@@ -64,12 +85,21 @@ def build_schemes(
         risk_flags: list[str] = []
         if bid_ceiling is not None and bid_ceiling > 0 and ex > bid_ceiling:
             risk_flags.append("超过招标限价")
+            risk_codes.add("over_ceiling")
             risks.append(f"{name}不含税 {float(ex):.2f} 超过限价 {float(bid_ceiling):.2f}")
         if cost_ex > 0 and ex < cost_ex:
             risk_flags.append("低于成本")
+            risk_codes.add("below_cost")
             risks.append(f"{name}低于测算成本")
         if m < Decimal("0.03"):
             risk_flags.append("毛利过低")
+            risk_codes.add("thin_margin")
+        sensitivity = []
+        for delta in (Decimal("-0.03"), Decimal("0"), Decimal("0.03")):
+            sensitive_ex = _q(ex * (Decimal("1") - delta))
+            sensitive_margin = ((sensitive_ex - cost_ex) / sensitive_ex) if sensitive_ex > 0 else Decimal("0")
+            room = (bid_ceiling - sensitive_ex) if bid_ceiling is not None else None
+            sensitivity.append({"downRateDelta": float(delta), "margin": float(sensitive_margin), "ceilingRoom": float(room) if room is not None else None})
         schemes.append(
             {
                 "name": name,
@@ -79,6 +109,9 @@ def build_schemes(
                 "tip": tip,
                 "risks": risk_flags,
                 "recommended": name.startswith("均衡"),
+                "sensitivity": sensitivity,
+                "riskCodes": sorted(risk_codes),
+                "unbalanced": unbalanced,
             }
         )
 
@@ -88,6 +121,10 @@ def build_schemes(
             risks.append("测算成本已高于招标限价，需核减工程量或议价")
         else:
             risks.append(f"限价相对成本余量约 {float(room):.2f} 元")
+    if unbalanced["detected"]:
+        risks.append(unbalanced["suggestion"])
+    for scheme in schemes:
+        scheme["riskCodes"] = sorted(risk_codes)
 
     loc = (location or "").strip() or "未注明"
     days = f"{int(duration_days)} 天" if duration_days else "未注明"

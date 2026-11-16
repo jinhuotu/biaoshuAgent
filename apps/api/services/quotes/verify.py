@@ -1,4 +1,4 @@
-"""核算校验：数量、合价、重名、功率冲突。"""
+"""核算校验：数量、合价、重名、规格冲突。"""
 
 from __future__ import annotations
 
@@ -8,11 +8,10 @@ from decimal import Decimal, ROUND_HALF_UP
 from typing import Any
 
 from api.services.quotes.catalog import money
+from api.services.quotes.contract import current_pack_id
+from api.services.quotes.packs import QuotePack, load_pack
 
 _TWO = Decimal("0.01")
-_KW_RE = re.compile(r"(\d+(?:\.\d+)?)kw", re.I)
-
-
 def _qty(raw: object) -> Decimal:
     try:
         n = Decimal(str(raw or "0"))
@@ -25,7 +24,28 @@ def _norm_name(name: str) -> str:
     return re.sub(r"[\s\-_/／（）()【】\[\]]+", "", (name or "").lower())
 
 
-def verify_lines(lines: list[dict[str, Any]]) -> dict[str, Any]:
+def _spec_values(text: str, pack: QuotePack) -> dict[str, set[Decimal]]:
+    values: dict[str, set[Decimal]] = {}
+    normalized = re.sub(r"\s+", "", text or "")
+    for pattern in pack.spec_patterns:
+        try:
+            matches = re.findall(pattern.regex, normalized, re.IGNORECASE)
+        except re.error:
+            continue
+        found: set[Decimal] = set()
+        for match in matches:
+            raw = match[0] if isinstance(match, tuple) else match
+            try:
+                found.add(Decimal(str(raw)))
+            except Exception:
+                continue
+        if found:
+            values[pattern.key] = found
+    return values
+
+
+def verify_lines(lines: list[dict[str, Any]], *, pack_id: str | None = None) -> dict[str, Any]:
+    pack = load_pack(pack_id or current_pack_id())
     issues: list[dict[str, Any]] = []
     by_name: dict[str, list[int]] = defaultdict(list)
 
@@ -92,23 +112,23 @@ def verify_lines(lines: list[dict[str, Any]]) -> dict[str, Any]:
             }
         )
 
-    # 同名不同功率
-    kw_by_base: dict[str, set[float]] = defaultdict(set)
+    # 同名同规格模式出现多个数值时报告冲突。
+    spec_by_base: dict[tuple[str, str], set[Decimal]] = defaultdict(set)
     for row in lines:
         name = str(row.get("name") or "")
-        blob = f"{name} {row.get('spec') or ''}"
-        kws = {float(x) for x in _KW_RE.findall(blob.replace(" ", ""))}
-        base = _norm_name(re.sub(_KW_RE, "", blob))
-        if base and kws:
-            kw_by_base[base] |= kws
-    for base, kws in kw_by_base.items():
-        if len(kws) >= 2:
+        specs = _spec_values(f"{name} {row.get('spec') or ''}", pack)
+        base = _norm_name(name)
+        for key, values in specs.items():
+            if base:
+                spec_by_base[(base, key)] |= values
+    for (base, key), values in spec_by_base.items():
+        if len(values) >= 2:
             issues.append(
                 {
-                    "code": "power_conflict",
+                    "code": "spec_conflict",
                     "level": "warn",
                     "row": 0,
-                    "message": f"同类设备出现多种功率：{', '.join(f'{int(k) if k == int(k) else k}kW' for k in sorted(kws))}",
+                    "message": f"同名项的规格模式 {key} 出现多个数值：{', '.join(str(value) for value in sorted(values))}",
                 }
             )
 

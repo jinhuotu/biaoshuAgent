@@ -36,6 +36,12 @@ poetry.toml
 .coverage
 htmlcov/
 
+# 测试与一次性脚本的临时产物（勿提交）
+# tmp/ 目前由 sparse-checkout 排除在工作区外，这里再加一道防线：
+# 测试每次运行会在这里生成 quote-ingest-*、bad-pack-* 等目录
+tmp/
+.pytest-*/
+
 # Local storage placeholders
 data/
 uploads/

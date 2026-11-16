@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import logging
 import re
+import tempfile
 from decimal import Decimal
+from pathlib import Path
 
 from fastapi import APIRouter, File, Form, Query, UploadFile
 from fastapi.responses import FileResponse
@@ -21,11 +23,15 @@ from api.services.quotes.assemble import (
 )
 from api.services.quotes.boq import lines_from_boq_bytes
 from api.services.quotes.catalog import list_catalog_hits
-from api.services.quotes.contract import PURPOSE_LABEL, default_rates_dict, normalize_purpose
-from api.services.quotes.costing import apply_costing
+from api.services.quotes.contract import PURPOSE_LABEL, activate_pack, default_rates_dict, normalize_purpose
+from api.services.quotes.costing import activate_model, apply_costing
 from api.services.quotes.decide import build_schemes
-from api.services.quotes.excel import resolve_quote_file
+from api.services.quotes.excel import activate_quality, resolve_quote_file
 from api.services.quotes.library import docs_for_quote_kb
+from api.services.quotes.ingest import ingest
+from api.services.quotes.packs import list_packs
+from api.services.quotes.packs import load_pack
+from api.services.quotes.quality import enforce_quality, run_quality
 from api.services.quotes.records import (
     can_see_cost,
     clear_mine,
@@ -78,6 +84,22 @@ async def quotes_meta(user: CurrentUser):
     )
 
 
+@router.get("/packs")
+async def quotes_packs(user: CurrentUser):
+    _require_menu(user)
+    return ok(
+        [
+            {
+                "id": pack.id,
+                "name": pack.name,
+                "unitCount": len(pack.units),
+                "specPatternCount": len(pack.spec_patterns),
+            }
+            for pack in list_packs()
+        ]
+    )
+
+
 @router.post("/recognize")
 async def quotes_recognize(
     db: DbSession,
@@ -87,6 +109,7 @@ async def quotes_recognize(
     note: str | None = Form(None, max_length=2000),
     projectName: str | None = Form(None, max_length=120),
     purpose: str | None = Form("quote"),
+    packId: str = Form("default_charger", max_length=64),
     location: str | None = Form(None, max_length=128),
     durationDays: float | None = Form(None),
 ):
@@ -114,11 +137,21 @@ async def quotes_recognize(
     if not blobs:
         raise AppError(ErrorCode.VALIDATION, "请上传场地规划图", status_code=422)
     bom = await read_site_map(db, blobs, note=note or "")
+    # Run the unified ingestion contract as the common parsing layer. The
+    # legacy assembly path below keeps the existing response fields and rules.
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as fh:
+        fh.write(blobs[0][1])
+        drawing_path = Path(fh.name)
+    try:
+        ingest([drawing_path], {"projectName": projectName or "", "vision_data": bom, "note": note or "", "legacy": True, "packId": packId})
+    finally:
+        drawing_path.unlink(missing_ok=True)
     kb_id, kb_name, docs = await docs_for_quote_kb(db, user, baseId)
     data = await recognize_from_bom(
         data=bom,
         docs=docs,
         project_name=projectName or "",
+        pack_id=packId,
     )
     data["baseId"] = kb_id
     data["baseName"] = kb_name
@@ -126,7 +159,7 @@ async def quotes_recognize(
     data["stage"] = "parsed"
     data["location"] = (location or "").strip()
     data["durationDays"] = durationDays
-    data["verify"] = verify_lines(data.get("lines") or [])
+    data["verify"] = verify_lines(data.get("lines") or [], pack_id=packId)
     data["stage"] = "verified"
     data["unmatched"] = pending_price_count(data.get("lines") or [])
     if purpose == "quote" and not can_see_cost(user):
@@ -142,6 +175,49 @@ async def quotes_recognize(
     return ok(data)
 
 
+@router.post("/ingest")
+async def quotes_ingest(
+    user: CurrentUser,
+    files: list[UploadFile] = File(...),
+    baseId: str | None = Form(None, max_length=32),
+    packId: str = Form("default_charger", max_length=64),
+    projectName: str | None = Form(None, max_length=120),
+    location: str | None = Form(None, max_length=128),
+    durationDays: float | None = Form(None),
+    note: str | None = Form(None, max_length=2000),
+):
+    _require_menu(user)
+    if not files:
+        raise AppError(ErrorCode.VALIDATION, "请至少上传一个资料文件", status_code=422)
+    temp_paths: list[Path] = []
+    try:
+        for upload in files:
+            suffix = Path(upload.filename or "upload.bin").suffix.lower() or ".bin"
+            with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as fh:
+                raw = await upload.read()
+                if not raw:
+                    continue
+                fh.write(raw)
+                temp_paths.append(Path(fh.name))
+        result = ingest(
+            temp_paths,
+            {
+                "projectName": projectName or "",
+                "location": location or "",
+                "durationDays": durationDays,
+                "note": note or "",
+                "packId": packId,
+            },
+        )
+        result["lines"] = [line.to_dict() for line in result["lines"]]
+        if baseId:
+            result["baseId"] = baseId
+        return ok(result)
+    finally:
+        for path in temp_paths:
+            path.unlink(missing_ok=True)
+
+
 @router.post("/parse-boq")
 async def quotes_parse_boq(
     db: DbSession,
@@ -149,6 +225,7 @@ async def quotes_parse_boq(
     file: UploadFile = File(..., description="工程量 Excel"),
     baseId: str = Form(..., min_length=1, max_length=32),
     purpose: str | None = Form("quote"),
+    packId: str = Form("default_charger", max_length=64),
     projectName: str | None = Form(None, max_length=120),
     location: str | None = Form(None, max_length=128),
     durationDays: float | None = Form(None),
@@ -156,14 +233,47 @@ async def quotes_parse_boq(
     _require_menu(user)
     purpose = normalize_purpose(purpose)
     raw = await file.read()
-    lines, warnings = lines_from_boq_bytes(raw, filename=file.filename or "boq.xlsx")
+    suffix = Path(file.filename or "boq.xlsx").suffix.lower() or ".xlsx"
+    if not raw:
+        raise AppError(ErrorCode.VALIDATION, "工程量文件为空", status_code=422)
+    if suffix not in {".xlsx", ".xlsm", ".csv"}:
+        raise AppError(ErrorCode.VALIDATION, "工程量仅支持 xlsx / xlsm / csv", status_code=422)
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as fh:
+        fh.write(raw)
+        boq_path = Path(fh.name)
+    try:
+        ingested = ingest([boq_path], {"projectName": projectName or "", "location": location or "", "durationDays": durationDays, "legacy": True, "packId": packId})
+    finally:
+        boq_path.unlink(missing_ok=True)
+    if not ingested["lines"]:
+        raise AppError(ErrorCode.VALIDATION, "未能从工程量文件解析出行（需含名称，以及数量或单价列）", status_code=422)
+    lines = []
+    for candidate in ingested["lines"]:
+        lines.append(
+            {
+                "seq": candidate.seq,
+                "name": candidate.name,
+                "spec": candidate.spec,
+                "unit": candidate.unit or "项",
+                "qty": candidate.qty,
+                "unitPrice": candidate.unit_price,
+                "costPrice": candidate.cost_price,
+                "sellPrice": candidate.unit_price,
+                "amount": candidate.amount,
+                "source": "boq",
+                "matchStatus": "" if candidate.unit_price <= 0 else "official",
+                "note": "；".join(candidate.notes),
+            }
+        )
+    lines = number_lines(lines)
+    warnings = list(ingested["warnings"])
     kb_id, kb_name, docs = await docs_for_quote_kb(db, user, baseId)
-    catalog, cat_err, meta = catalog_from_docs(docs)
+    catalog, cat_err, meta = catalog_from_docs(docs, pack_id=packId)
     warnings.extend(cat_err)
     # 有单价的工程量行保留；无单价的对价目
     need = [r for r in lines if not (float(r.get("unitPrice") or 0) > 0)]
     if need:
-        warnings.extend(apply_catalog(need, catalog))
+        warnings.extend(apply_catalog(need, catalog, pack_id=packId))
     for r in lines:
         if float(r.get("unitPrice") or 0) > 0 and not str(r.get("matchStatus") or "").strip():
             r["matchStatus"] = "official"
@@ -181,7 +291,7 @@ async def quotes_parse_boq(
         "catalog": meta,
         "baseId": kb_id,
         "baseName": kb_name,
-        "verify": verify_lines([_dump_line(r) for r in lines]),
+        "verify": verify_lines([_dump_line(r) for r in lines], pack_id=packId),
     }
     if purpose == "quote" and not can_see_cost(user):
         payload["lines"] = _redact_lines(payload["lines"])
@@ -192,10 +302,10 @@ async def quotes_parse_boq(
 async def quotes_verify(body: VerifyQuoteIn, user: CurrentUser):
     _require_menu(user)
     rows = [ln.model_dump() for ln in body.lines if str(ln.name or "").strip()]
-    report = verify_lines(rows)
+    report = verify_lines(rows, pack_id=body.packId)
     if body.applyFixes:
         rows = apply_amount_fixes(rows, report)
-        report = verify_lines(rows)
+        report = verify_lines(rows, pack_id=body.packId)
     return ok({"verify": report, "lines": rows if body.applyFixes else None})
 
 
@@ -203,8 +313,16 @@ async def quotes_verify(body: VerifyQuoteIn, user: CurrentUser):
 async def quotes_cost(body: CostQuoteIn, user: CurrentUser):
     _require_menu(user)
     rows = [ln.model_dump() for ln in body.lines if str(ln.name or "").strip()]
-    rates = body.rates.model_dump() if body.rates else default_rates_dict()
-    costed, summary = apply_costing(rows, rates)
+    rates = body.rates.model_dump() if body.rates else default_rates_dict(body.packId)
+    costed, summary = apply_costing(
+        rows,
+        rates,
+        model=body.costingModel,
+        pack_id=body.packId,
+        options={"referenceTotal": body.referenceTotal, "downRate": body.downRate},
+    )
+    pack = load_pack(body.packId)
+    quality = run_quality(costed, summary, pack)
     schemes = []
     if normalize_purpose(body.purpose) == "quote":
         schemes, _, _ = build_schemes(
@@ -216,6 +334,8 @@ async def quotes_cost(body: CostQuoteIn, user: CurrentUser):
             project_name=body.projectName,
             location=body.location or "",
             duration_days=body.durationDays,
+            lines=costed,
+            quality=quality,
         )
     dumped = [_dump_line(r) for r in costed]
     if body.purpose == "quote" and not can_see_cost(user):
@@ -226,7 +346,9 @@ async def quotes_cost(body: CostQuoteIn, user: CurrentUser):
             "stage": "costed",
             "lines": dumped,
             "costSummary": summary,
-            "verify": verify_lines(costed),
+            "verify": verify_lines(costed, pack_id=body.packId),
+            "model": body.costingModel,
+            "quality": quality,
             "schemes": schemes,
         }
     )
@@ -235,12 +357,18 @@ async def quotes_cost(body: CostQuoteIn, user: CurrentUser):
 @router.post("/generate")
 async def quotes_generate(body: GenerateQuoteIn, db: DbSession, user: CurrentUser):
     _require_menu(user)
-    payload = await create_from_generate(
-        db,
-        body,
-        user_id=int(user.id),
-        username=user.username or "",
-    )
+    pack = load_pack(body.packId)
+    pre_quality = run_quality([line.model_dump() for line in body.lines], {}, pack)
+    enforce_quality(pre_quality, force_export=body.forceExport)
+    with activate_pack(body.packId), activate_model(body.costingModel), activate_quality(pre_quality, body.forceExport):
+        payload = await create_from_generate(
+            db,
+            body,
+            user_id=int(user.id),
+            username=user.username or "",
+        )
+    payload["quality"] = pre_quality
+    payload["model"] = body.costingModel
     logger.info(
         "quote generate user=%s purpose=%s id=%s lines=%s",
         user.username,
@@ -265,13 +393,14 @@ async def quotes_catalog_candidates(
 ):
     _require_menu(user)
     _kb_id, kb_name, docs = await docs_for_quote_kb(db, user, body.baseId)
-    catalog, errors, meta = catalog_from_docs(docs)
+    catalog, errors, meta = catalog_from_docs(docs, pack_id=body.packId)
     hits = list_catalog_hits(
         name=body.name,
         spec=body.spec,
         code=body.code,
         catalog=catalog,
         limit=body.limit,
+        pack_id=body.packId,
     )
     if not can_see_cost(user):
         hits = [{**h, "costPrice": 0} for h in hits]

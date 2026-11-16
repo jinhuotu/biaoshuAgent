@@ -3,16 +3,20 @@
 from __future__ import annotations
 
 import re
+from contextlib import contextmanager
+from contextvars import ContextVar
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 from api.services.quotes.catalog import money
-from api.services.quotes.contract import EXPORT_SHEETS, normalize_purpose
+from api.services.quotes.contract import EXPORT_SHEETS, current_pack_id, normalize_purpose
 from api.services.quotes.library import quotes_output_dir
+from api.services.quotes.packs import QuotePack, load_pack
 from api.services.quotes.schema import QuoteLineIn
 from common.errors import AppError, ErrorCode
+from api.services.tenders.tables import quote_role
 
 _TWO = Decimal("0.01")
 _FILE_RE = re.compile(r"^[a-f0-9]{12}\.xlsx$", re.I)
@@ -22,6 +26,16 @@ _COL_WIDTHS = (8, 22, 36, 8, 10, 14, 14, 14, 18, 22)
 _LINE_PT = 14.5
 _ROW_H_MIN = 22.0
 _ROW_H_MAX = 360.0
+_ACTIVE_QUALITY: ContextVar[tuple[dict[str, Any] | None, bool]] = ContextVar("quote_export_quality", default=(None, False))
+
+
+@contextmanager
+def activate_quality(quality: dict[str, Any] | None, force_export: bool = False):
+    token = _ACTIVE_QUALITY.set((quality, force_export))
+    try:
+        yield
+    finally:
+        _ACTIVE_QUALITY.reset(token)
 
 
 def _norm_cell_text(val: Any) -> Any:
@@ -119,11 +133,27 @@ def write_quote_xlsx(
     schemes: list[dict[str, Any]] | None = None,
     instruction: str = "",
     verify: dict[str, Any] | None = None,
+    pack: QuotePack | None = None,
+    pack_id: str | None = None,
+    quality: dict[str, Any] | None = None,
+    force_export: bool | None = None,
 ) -> tuple[Path, str, Decimal, Decimal]:
     from openpyxl import Workbook
     from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 
     purpose = normalize_purpose(purpose)
+    active_quality, active_force = _ACTIVE_QUALITY.get()
+    quality = quality if quality is not None else active_quality
+    force_export = active_force if force_export is None else force_export
+    pack = pack or load_pack(pack_id or current_pack_id())
+    quality_warnings: list[str] = []
+    if quality:
+        if float(quality.get("pricedRatio") or 0) < 0.6:
+            quality_warnings.append("有效报价行比例低于 0.6")
+        if int(quality.get("pendingCount") or 0) > 0:
+            quality_warnings.append(f"含 {int(quality['pendingCount'])} 项待核价")
+        if quality_warnings and not force_export:
+            raise AppError(ErrorCode.VALIDATION, "质量门未通过：" + "；".join(quality_warnings), status_code=422)
     rows = [ln for ln in lines if str(ln.name or "").strip()]
     if not rows:
         raise AppError(ErrorCode.VALIDATION, "没有明细行，无法生成", status_code=422)
@@ -141,15 +171,15 @@ def write_quote_xlsx(
     money_fmt = "#,##0.00"
 
     wb = Workbook()
-    sheet_title = EXPORT_SHEETS.get(purpose, "报价单")
+    sheet_title = pack.output_titles.get(purpose) or pack.output_titles.get("sheet") or EXPORT_SHEETS.get(purpose, "报价单")
     ws = wb.active
     ws.title = sheet_title[:31]
     title = (project_name or "").strip() or sheet_title
-    headers = _headers_for(purpose)
+    headers = _headers_for(purpose, pack)
     col_n = len(headers)
 
     ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=col_n)
-    ws["A1"] = title
+    ws["A1"] = f"{title}\n{'；'.join(quality_warnings)}" if quality_warnings else title
     ws["A1"].font = title_font
     ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
     ws.row_dimensions[1].height = 28
@@ -185,7 +215,7 @@ def write_quote_xlsx(
         price = _line_price(purpose, cost, sell, ln.unitPrice)
         amount = money(qty, price)
         total += amount
-        values = [_norm_cell_text(v) for v in _row_values(purpose, i, ln, qty, cost, sell, price, amount)]
+        values = [_norm_cell_text(v) for v in _row_values(purpose, i, ln, qty, cost, sell, price, amount, headers)]
         r = 3 + i
         row_h = _row_height_for(values, widths)
         for c, val in enumerate(values, start=1):
@@ -218,13 +248,13 @@ def write_quote_xlsx(
         cell.border = thin
 
     if cost_summary:
-        _write_summary_sheet(wb, cost_summary, purpose)
+        _write_summary_sheet(wb, cost_summary, purpose, pack)
     if verify and (verify.get("issues") or []):
         _write_verify_sheet(wb, verify)
     if purpose == "quote":
         _write_bid_sheet(wb, rows, tax_rate, total, inc)
         if schemes:
-            _write_schemes_sheet(wb, schemes, instruction or "")
+            _write_schemes_sheet(wb, schemes, instruction or "", pack)
 
     stem = uuid4().hex[:12]
     dest = quotes_output_dir() / f"{stem}.xlsx"
@@ -243,7 +273,14 @@ def write_quote_xlsx(
     return dest, safe_download_name(title, purpose=purpose), total, inc
 
 
-def _headers_for(purpose: str) -> tuple[str, ...]:
+def _headers_for(purpose: str, pack: QuotePack | None = None) -> tuple[str, ...]:
+    if pack is not None and pack.columns:
+        roles = {quote_role(value) for value in pack.columns}
+        required = {"seq", "name", "spec", "unit", "qty", "price", "amount"}
+        if not required.issubset(roles):
+            missing = ", ".join(sorted(required - roles))
+            raise AppError(ErrorCode.VALIDATION, f"行业包列头缺少必要角色：{missing}", status_code=422)
+        return tuple(pack.columns)
     if purpose == "cost":
         return ("序号", "名称", "规格型号", "单位", "数量", "成本单价", "成本合价", "备注", "来源")
     if purpose == "budget":
@@ -268,18 +305,24 @@ def _line_price(purpose: str, cost: Decimal, sell: Decimal, unit: Decimal) -> De
     return sell if sell > 0 else (unit if unit > 0 else cost)
 
 
-def _row_values(purpose, i, ln, qty, cost, sell, price, amount):
-    return [
-        i,
-        ln.name,
-        ln.spec,
-        ln.unit or "项",
-        qty,
-        price if price > 0 else None,
-        amount if price > 0 else None,
-        ln.note,
-        _source_label(ln.source, ln.matchName),
-    ]
+def _row_values(purpose, i, ln, qty, cost, sell, price, amount, headers=None):
+    headers = headers or _headers_for(purpose)
+    values = []
+    for header in headers:
+        role = quote_role(header)
+        values.append({
+            "seq": i,
+            "name": ln.name,
+            "spec": ln.spec,
+            "unit": ln.unit or "项",
+            "qty": qty,
+            "price": price if price > 0 else None,
+            "cost_price": cost if cost > 0 else None,
+            "sell_price": sell if sell > 0 else None,
+            "amount": amount if price > 0 else None,
+            "extra": ln.note,
+        }.get(role, _source_label(ln.source, ln.matchName) if role is None else None))
+    return values
 
 
 def _source_label(source: str, match_name: str) -> str:
@@ -298,8 +341,8 @@ def _source_label(source: str, match_name: str) -> str:
     return base
 
 
-def _write_summary_sheet(wb, summary: dict[str, Any], purpose: str) -> None:
-    ws = wb.create_sheet("费用汇总")
+def _write_summary_sheet(wb, summary: dict[str, Any], purpose: str, pack: QuotePack | None = None) -> None:
+    ws = wb.create_sheet((pack.output_titles.get("summary") if pack else "费用汇总")[:31])
     ws.append(["科目", "金额（元）"])
     rows = [
         ("材料费", summary.get("materialCost")),
@@ -351,7 +394,7 @@ def _write_bid_sheet(wb, rows: list, tax_rate: Decimal, total: Decimal, inc: Dec
         cell.alignment = Alignment(horizontal="center", wrap_text=True)
 
 
-def _write_schemes_sheet(wb, schemes: list[dict[str, Any]], instruction: str) -> None:
+def _write_schemes_sheet(wb, schemes: list[dict[str, Any]], instruction: str, pack: QuotePack | None = None) -> None:
     from openpyxl.styles import Alignment
 
     ws = wb.create_sheet("报价方案")
@@ -381,7 +424,7 @@ def _write_schemes_sheet(wb, schemes: list[dict[str, Any]], instruction: str) ->
                 vertical="top" if h > _ROW_H_MIN + 1 else "center",
             )
     if instruction:
-        ws2 = wb.create_sheet("编制说明")
+        ws2 = wb.create_sheet((pack.output_titles.get("note") if pack else "编制说明")[:31])
         ws2["A1"] = _norm_cell_text(instruction)
         ws2["A1"].alignment = Alignment(wrap_text=True, vertical="top")
         ws2.column_dimensions["A"].width = 100
