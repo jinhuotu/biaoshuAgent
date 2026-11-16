@@ -32,6 +32,8 @@ PROTECTED_FILES = [
     "apps/api/routers/tenders.py",
 ]
 EXTERNAL_FILES = [
+    # 前端仓库与本仓库同级存放时（任何机器、任何盘符）
+    str(ROOT.parent / "weitaiAgentui" / "src" / "views" / "TendersView.vue"),
     "D:/code/LLM/weitaiAgentui/src/views/TendersView.vue",
     "E:/code/python/weitaiAgentui/src/views/TendersView.vue",
 ]
@@ -73,7 +75,7 @@ def collect() -> dict[str, str]:
     external_found = False
     for raw in EXTERNAL_FILES:
         p = Path(raw)
-        if p.is_file():
+        if p.is_file() and not external_found:  # 多个候选位置只取第一个存在的
             external_found = True
             root = next((parent for parent in p.parents if parent.name == "weitaiAgentui"), p.parent)
             entries[f"external::{p.relative_to(root).as_posix()}"] = sha256_file(p)

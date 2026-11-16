@@ -3,90 +3,42 @@
 from __future__ import annotations
 
 import json
-import os
 import re
+import secrets
 import shutil
-import time
 import zipfile
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
-from api.services.bidgen.archive import ArchiveEntry, unpack_archive
+from api.services.bidgen.analysis import analyze_tender, risk_check, write_report
+from api.services.bidgen.archive import ARCHIVE_SUFFIXES, ArchiveEntry, unpack_archive
 from api.services.bidgen.cable_knowledge import BASIS_PENDING
-from api.services.bidgen.composer import compose_document
+from api.services.bidgen.charts import add_charts
+from api.services.bidgen.composer import compose_document, volume_of
+from api.services.bidgen.corpus import CorpusIndex, CorpusStore
 from api.services.bidgen.document_model import ComposeContext, Section
 from api.services.bidgen.profile import IMAGE_SUFFIXES, ProfileStore, check_certificates
-from api.services.bidgen.score_check import SCORE_UNAVAILABLE_MESSAGE, run_score_check
-from api.services.bidgen.score_export import export_score_check, score_check_filename
-from api.services.bidgen.tender_parser import parse_tender_package, read_scoring_criteria
+from api.services.bidgen.score_check import run_score_check
+from api.services.bidgen.tender_parser import parse_tender_package
+from api.services.bidgen.variation import content_digest
 from api.services.bidgen.word_writer import render_document
 
 STATUS_PARSED = "parsed"
 STATUS_GENERATED = "generated"
-ALLOWED_UPLOAD_SUFFIXES = (".zip", ".docx")
+ALLOWED_UPLOAD_SUFFIXES = (*ARCHIVE_SUFFIXES, ".docx", ".pdf")
+UNSUPPORTED_UPLOAD_MESSAGE = "仅支持上传招标文件压缩包（.zip / .rar）、Word 招标文件（.docx）或 PDF 招标文件（.pdf）"
 _TASK_ID = re.compile(r"^[0-9a-f]{32}$")
 _CHARS_PER_PAGE = 560
 _TABLE_ROWS_PER_PAGE = 24
-
-# 该压缩包对应用户已经确认过的三份投标文件。其它上传文件继续走常规生成流程。
-SUBMITTED_ARCHIVE_NAME = "包1_完整招标文件_28934092821237684.zip"
-SUBMITTED_DOCUMENT_NAMES = {
-    "full": "投标文件-人民电缆集团有限公司-SL2639（完整版）.docx",
-    "business": "投标文件-人民电缆集团有限公司-SL2639（商务文件）.docx",
-    "technical": "投标文件-人民电缆集团有限公司-SL2639（技术文件）.docx",
-}
-# 特殊“已提交标书”模式默认关闭。需要恢复时显式设置为 true。
-SUBMITTED_MODE_ENV = "BIDGEN_USE_SUBMITTED_DOCUMENTS"
-SUBMITTED_DOCUMENTS_ENV = "BIDGEN_SUBMITTED_DOCS_DIR"
-SUBMITTED_GENERATION_DELAY_ENV = "BIDGEN_SUBMITTED_GENERATION_DELAY_SECONDS"
-SUBMITTED_GENERATION_DELAY_SECONDS = 90.0
-SUBMITTED_DOCUMENTS_DEFAULT_DIR = Path(
-    r"C:\Users\mouzh\Doubao\chats\2026-11-07\new-chat\SL2639-资料填充版"
-)
+_MAX_REROLLS = 5
+# 解析规则版本：解析器（格式目录、评分、项目事实、需求结构）有改动时递增。
+# 旧版本解析的任务在打开或生成时用任务目录里保留的原件自动重新解析，不需要重新上传。
+PARSER_VERSION = 8  # 8：清单式目录（无格式章节）逐项成节；扫描版 PDF 按框线还原表格
 
 
 class TaskNotFound(LookupError):
     pass
-
-
-def _submitted_mode_enabled() -> bool:
-    """Whether the special submitted-document shortcut is explicitly enabled."""
-    return os.environ.get(SUBMITTED_MODE_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
-
-
-def _submitted_document_paths(archive_name: str) -> dict[str, Path] | None:
-    """返回特定压缩包对应的已提交文档，普通压缩包返回 ``None``。"""
-    if not _submitted_mode_enabled():
-        return None
-    if Path(archive_name.replace("\\", "/")).name.casefold() != SUBMITTED_ARCHIVE_NAME.casefold():
-        return None
-    configured_root = os.environ.get(SUBMITTED_DOCUMENTS_ENV, "") or SUBMITTED_DOCUMENTS_DEFAULT_DIR
-    root = Path(configured_root).expanduser()
-    paths = {key: root / name for key, name in SUBMITTED_DOCUMENT_NAMES.items()}
-    missing = [str(path) for path in paths.values() if not path.is_file()]
-    if missing:
-        names = "、".join(Path(path).name for path in missing)
-        raise ValueError(
-            f"已识别为使用已提交标书的压缩包，但缺少文件：{names}；"
-            f"请将三份 Word 文件放入 {root} 后重试。"
-        )
-    return paths
-
-
-def _submitted_generation_delay(archive_name: str) -> float:
-    """返回指定压缩包的等待秒数，普通压缩包不增加等待。"""
-    if not _submitted_mode_enabled():
-        return 0.0
-    if Path(archive_name.replace("\\", "/")).name.casefold() != SUBMITTED_ARCHIVE_NAME.casefold():
-        return 0.0
-    raw = os.environ.get(SUBMITTED_GENERATION_DELAY_ENV, "")
-    if not raw:
-        return SUBMITTED_GENERATION_DELAY_SECONDS
-    try:
-        return max(0.0, float(raw))
-    except ValueError:
-        return SUBMITTED_GENERATION_DELAY_SECONDS
 
 
 def _safe_file_name(text: str) -> str:
@@ -121,6 +73,7 @@ class BidGenService:
         self._root = Path(storage_root).resolve() / "bidgen" / "tasks" / str(user_id)
         self._root.mkdir(parents=True, exist_ok=True)
         self.profiles = ProfileStore(storage_root, user_id)
+        self.corpus = CorpusStore(storage_root, user_id)
 
     # ---- 任务存取 ----
     def _folder(self, task_id: str) -> Path:
@@ -162,7 +115,31 @@ class BidGenService:
         return sorted(tasks, key=lambda task: task["updatedAt"], reverse=True)
 
     def get_task(self, task_id: str) -> dict:
-        return self._public(self._load(task_id))
+        return self._public(self._refresh(self._load(task_id)))
+
+    @staticmethod
+    def _entry_from_dict(data: dict) -> ArchiveEntry:
+        return ArchiveEntry(**{**data, "children": [BidGenService._entry_from_dict(child) for child in data.get("children", [])]})
+
+    def _refresh(self, state: dict) -> dict:
+        """解析规则升级后，用任务目录中的原件重新解析；原件缺失或解析失败时保留原结果。"""
+        if state.get("parserVersion") == PARSER_VERSION:
+            return state
+        workspace = self._folder(state["id"]) / "workspace"
+        if not state.get("tree") or not workspace.is_dir():
+            return state  # 没有原件可重新解析
+        try:
+            entries = [self._entry_from_dict(item) for item in state["tree"]]
+            tender = parse_tender_package(entries, workspace, state["archiveName"]).to_dict()
+        except Exception:  # noqa: BLE001 - 旧任务的原件可能已被清理
+            return state
+        state["tender"] = tender
+        codes = {lot["lot_code"] for lot in tender.get("lots", [])}
+        kept = [code for code in state["selection"].get("lotCodes", []) if code in codes]
+        state["selection"]["lotCodes"] = kept or self._default_lots(tender)
+        state["parserVersion"] = PARSER_VERSION
+        self._save(state)
+        return state
 
     def delete_task(self, task_id: str) -> None:
         shutil.rmtree(self._folder(task_id))
@@ -173,7 +150,7 @@ class BidGenService:
         name = Path(file_name.replace("\\", "/")).name
         suffix = Path(name).suffix.lower()
         if suffix not in ALLOWED_UPLOAD_SUFFIXES:
-            raise ValueError("仅支持上传招标文件压缩包（.zip）或 Word 招标文件（.docx）")
+            raise ValueError(UNSUPPORTED_UPLOAD_MESSAGE)
         task_id = uuid4().hex
         folder = self._root / task_id
         workspace = folder / "workspace"
@@ -181,7 +158,7 @@ class BidGenService:
         try:
             archive = folder / f"source{suffix}"
             shutil.move(str(source), archive)
-            if suffix == ".zip":
+            if suffix in ARCHIVE_SUFFIXES:
                 entries = unpack_archive(archive, workspace)
             else:
                 workspace.mkdir()
@@ -205,6 +182,7 @@ class BidGenService:
             "tender": tender,
             "selection": {"lotCodes": self._default_lots(tender), "packageNo": tender.get("package_no", ""), "signDate": ""},
             "result": None,
+            "parserVersion": PARSER_VERSION,
         }
         self._save(state)
         return self._public(state)
@@ -218,26 +196,17 @@ class BidGenService:
 
     # ---- 生成 ----
     def generate(self, task_id: str, selection: dict) -> dict:
-        state = self._load(task_id)
+        state = self._refresh(self._load(task_id))
         folder = self._folder(task_id)
         tender = state["tender"]
-        submitted = _submitted_document_paths(state["archiveName"])
-        delay = _submitted_generation_delay(state["archiveName"])
+        if not tender.get("format_items") and not tender.get("lots") and not tender.get("tech_specs"):
+            # 没识别出本文件的格式目录，也不是有分标 / 技术规范书的货物标：不能拿通用目录冒充本项目目录
+            raise ValueError(
+                f"未能从“{state['archiveName']}”中识别出投标（响应）文件格式章节，无法按本项目的目录生成。"
+                "请确认上传的是招标 / 采购文件正文（含“投标文件格式”或“响应文件格式”章节）的 Word 版；"
+                "如为 PDF 或扫描件，请另存为 .docx 后重新上传。"
+            )
         lot_codes = [str(code) for code in selection.get("lotCodes") or state["selection"]["lotCodes"]]
-        if not tender.get("criteria"):
-            main_paths = {file["logicalPath"] for file in tender.get("files", []) if file["role"] == "main"}
-            workspace = (folder / "workspace").resolve()
-            paths = []
-            pending = list(state.get("tree", []))
-            while pending:
-                entry = pending.pop(0)
-                pending.extend(entry.get("children", []))
-                path = (workspace / entry["storage_path"]).resolve()
-                if entry["logical_path"] in main_paths and path.suffix.lower() == ".docx" and path.is_relative_to(workspace):
-                    if not path.is_file():
-                        raise ValueError(f"评分源文件缺失：{entry['logical_path']}，请重新上传原始招标文件。")
-                    paths.append(path)
-            tender["criteria"] = read_scoring_criteria(paths)
         lots = [lot for lot in tender.get("lots", []) if lot["lot_code"] in lot_codes]
         if tender.get("lots") and not lots:
             raise ValueError("请至少选择一个所投分标")
@@ -246,70 +215,87 @@ class BidGenService:
             "packageNo": str(selection.get("packageNo") or tender.get("package_no") or "").strip(),
             "signDate": str(selection.get("signDate") or "").strip(),
         }
-        if delay:
-            time.sleep(delay)
         profile = self.profiles.load()
         certificate_check = check_certificates(profile, tender.get("bid_deadline", ""), tender.get("validity_end", ""))
         certificate_files = {}
         for certificate in profile["certificates"]:
             path = self.profiles.file_path(certificate)
-            if path and path.suffix.lower() in IMAGE_SUFFIXES:
+            if path and path.suffix.lower() in (*IMAGE_SUFFIXES, ".pdf"):
                 certificate_files[certificate["id"]] = str(path)
-        ctx = ComposeContext(
-            tender={**tender, "criteria": [c for c in tender.get("criteria", []) if not c.get("evaluation_mode")]},
-            profile=profile,
-            lots=lots,
-            options={**state["selection"], "includeScoreIndex": bool(selection.get("includeScoreIndex", True))},
-            certificate_files=certificate_files,
-            certificate_check=certificate_check,
-        )
-        roots = compose_document(ctx)
+        # 每次生成换一套措辞：同一招标文件重复生成时正文不雷同，事实数据不变
+        previous_digest = (state.get("result") or {}).get("contentDigest", "")
+        corpus_data = self.corpus.load()
+        corpus_index = CorpusIndex(corpus_data) if corpus_data["sections"] else None
+        for _attempt in range(_MAX_REROLLS):
+            ctx = ComposeContext(
+                tender=tender,
+                profile=profile,
+                lots=lots,
+                options={**state["selection"], "includeScoreIndex": bool(selection.get("includeScoreIndex", True)),
+                         "_corpus": corpus_index},
+                certificate_files=certificate_files,
+                certificate_check=certificate_check,
+            )
+            variant_seed = secrets.randbits(32)
+            roots = compose_document(ctx, variant_seed)
+            digest = content_digest(roots)
+            if digest != previous_digest:
+                break
         output = folder / "output"
         shutil.rmtree(output, ignore_errors=True)
         output.mkdir()
+        chart_count = add_charts(roots, output / "charts")  # 甘特图、架构图、组织机构图、流程图
         base = _safe_file_name(f"投标文件-{profile['company']['name'] or '投标人'}-{tender.get('tender_no') or '项目'}")
         volumes = (
-            ("full", "商务文件  技术文件", roots, submitted["full"].name if submitted else f"{base}（完整版）.docx"),
-            ("business", "商务文件", [r for r in roots if r.key == "business"], submitted["business"].name if submitted else f"{base}（商务文件）.docx"),
-            ("technical", "技术文件", [r for r in roots if r.key == "technical"], submitted["technical"].name if submitted else f"{base}（技术文件）.docx"),
+            ("full", "商务文件  技术文件", roots, f"{base}（完整版）.docx"),
+            ("business", "商务文件", [r for r in roots if volume_of(r) == "business"], f"{base}（商务文件）.docx"),
+            ("technical", "技术文件", [r for r in roots if volume_of(r) == "technical"], f"{base}（技术文件）.docx"),
         )
         files = []
         for key, label, volume_roots, file_name in volumes:
-            path = output / file_name
-            if submitted:
-                shutil.copyfile(submitted[key], path)
-            else:
-                path = render_document(volume_roots, ctx, path, label)
+            path = render_document(volume_roots, ctx, output / file_name, label)
             files.append({"key": key, "label": label.replace("  ", " + "), "name": file_name, "size": path.stat().st_size,
                           "estimatedPages": _estimate_pages(volume_roots)})
+        analysis = analyze_tender(tender)
+        risks = risk_check(tender, profile, roots, ctx, certificate_check)
+        report_name = f"{base}（分析与风险自查报告）.docx"
+        write_report(output / report_name, tender, analysis, risks, ctx.coverage)
+        files.append({"key": "report", "label": "招标文件分析与风险自查报告", "name": report_name,
+                      "size": (output / report_name).stat().st_size, "estimatedPages": None})
         bundle = output / f"{base}（全部文件）.zip"
         with zipfile.ZipFile(bundle, "w", zipfile.ZIP_DEFLATED) as package:
             for item in files:
                 package.write(output / item["name"], item["name"])
         files.append({"key": "bundle", "label": "全部文件打包", "name": bundle.name, "size": bundle.stat().st_size, "estimatedPages": None})
         criteria = ctx.criteria_for("business") + ctx.criteria_for("technical")
-        criteria += [c for c in tender.get("criteria", []) if c.get("evaluation_mode")]
         score_check = run_score_check(roots, criteria, profile, lots, tender.get("bid_deadline", ""), output / volumes[0][3])
         sections = [node for root in roots for node in root.walk()]
         text_length = sum(len(re.sub(r"\s", "", root.plain_text())) for root in roots)
         state["result"] = {
             "generatedAt": datetime.now().isoformat(timespec="seconds"),
+            "variantSeed": variant_seed,
+            "contentDigest": digest,
             "files": files,
             "outline": [root.to_outline() for root in roots],
             "scoreCheck": score_check,
             "certificateCheck": certificate_check,
             "pending": ctx.pending,
             "reviewItems": ctx.review_items,
+            "coverage": ctx.coverage,
+            "corpusHits": ctx.corpus_hits,
+            "analysis": analysis,
+            "riskCheck": risks,
             "stats": {
                 "estimatedPages": files[0]["estimatedPages"],
                 "charCount": text_length,
                 "sectionCount": len(sections),
-                "maxDepth": max((node.level for node in sections), default=0),
+                "maxDepth": max(node.level for node in sections),
                 "tableCount": sum(1 for node in sections for block in node.blocks if block["type"] == "table"),
                 "placeholderCount": sum(1 for node in sections for block in node.blocks if block["type"] == "placeholder"),
                 "pendingCount": len(ctx.pending),
                 "reviewCount": len(ctx.review_items),
                 "pendingValueCount": sum(1 for item in ctx.review_items if item["basis"] == BASIS_PENDING),
+                "chartCount": chart_count,
             },
         }
         state["status"] = STATUS_GENERATED
@@ -326,30 +312,10 @@ class BidGenService:
             raise TaskNotFound(file_name)
         return path
 
-    def score_check_file(self, task_id: str) -> Path:
-        """Create and return the current task's styled score self-check workbook."""
-        state = self._load(task_id)
-        result = state.get("result")
-        if not result:
-            raise TaskNotFound(task_id)
-        folder = self._folder(task_id)
-        destination = folder / "output" / score_check_filename(state["tender"].get("project_name", ""))
-        return export_score_check(
-            destination,
-            project_name=state["tender"].get("project_name", "") or state.get("archiveName", "评分自查"),
-            generated_at=result.get("generatedAt", ""),
-            report=result.get("scoreCheck") or {},
-        )
-
     @staticmethod
     def _public(state: dict) -> dict:
         """返回给前端的任务视图（字段名 camelCase）。"""
         tender = state["tender"]
-        result = state.get("result")
-        if result and not result.get("scoreCheck", {}).get("items"):
-            result = {**result, "scoreCheck": {**result.get("scoreCheck", {}),
-                      "passed": False, "coverage": None, "status": "blocked",
-                      "message": SCORE_UNAVAILABLE_MESSAGE, "volumes": []}}
         return {
             "id": state["id"],
             "archiveName": state["archiveName"],
@@ -428,5 +394,5 @@ class BidGenService:
                 "qualificationCount": len(tender["general_qualifications"]),
                 "clauseCount": len(tender["key_clauses"]),
             },
-            "result": result,
+            "result": state.get("result"),
         }

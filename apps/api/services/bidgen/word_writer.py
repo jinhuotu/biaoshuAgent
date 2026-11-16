@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import re
 import zipfile
+from io import BytesIO
 from pathlib import Path
 
 from docx import Document
@@ -17,7 +18,15 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Cm, Pt, RGBColor
 
-from api.services.bidgen.document_model import PENDING_PREFIX, ComposeContext, Section
+from api.services.bidgen.document_model import (
+    PENDING_PREFIX,
+    UNDERLINE_END,
+    UNDERLINE_START,
+    ComposeContext,
+    Section,
+    strip_underline_marks,
+    underline,
+)
 
 FONT_BODY = "宋体"
 FONT_HEADING = "黑体"
@@ -33,6 +42,9 @@ MAX_IMAGE_HEIGHT_CM = 19.0
 IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".bmp", ".gif")
 
 _PENDING_SPLIT = re.compile(rf"({re.escape(PENDING_PREFIX)}[^】]*】)")
+_UNDERLINED_SPAN = re.compile(rf"{UNDERLINE_START}(.*?){UNDERLINE_END}", re.S)
+# 落款行：“标签：值（盖章/签字提示）”，值或空位画横线
+_SIGN_HINT = re.compile(r"(（[^（）]*(?:签|盖|章)[^（）]*）)$")
 _ALIGNMENTS = {"center": WD_ALIGN_PARAGRAPH.CENTER, "right": WD_ALIGN_PARAGRAPH.RIGHT, "left": WD_ALIGN_PARAGRAPH.LEFT}
 
 _APP_PROPERTIES = (
@@ -131,7 +143,10 @@ def _add_field(paragraph, instruction: str, cached: str = "") -> None:
             paragraph.add_run(cached)
 
 
-def _add_text(paragraph, text: str, *, bold: bool = False, size: float | None = None, east_asia: str = FONT_BODY) -> None:
+def _add_text(
+    paragraph, text: str, *, bold: bool = False, size: float | None = None, east_asia: str = FONT_BODY,
+    underlined: bool = False,
+) -> None:
     """写入文字；“【待填：…】”黄色高亮，便于定稿前逐个处理。"""
     for part in _PENDING_SPLIT.split(text):
         if not part:
@@ -142,8 +157,42 @@ def _add_text(paragraph, text: str, *, bold: bool = False, size: float | None = 
             _set_fonts(run, east_asia, size, bold or None)
             if part.startswith(PENDING_PREFIX):
                 run.font.highlight_color = WD_COLOR_INDEX.YELLOW
+            if underlined:
+                run.font.underline = True
             if index < len(lines) - 1:
                 run.add_break(WD_BREAK.LINE)
+
+
+def _add_form_text(paragraph, form: str, **options) -> None:
+    """带横线标记的文字：标记内的片段（填空位、已填的值）加单下划线。"""
+    parts = _UNDERLINED_SPAN.split(form)
+    for index, part in enumerate(parts):
+        if part:
+            _add_text(paragraph, part, underlined=index % 2 == 1, **options)
+
+
+def _paragraph_form(block: dict) -> str:
+    """段落块的横线原文；正文在生成后被改写过（与 form 不一致）时不再使用。"""
+    form = block.get("form") or ""
+    return form if form and strip_underline_marks(form) == block["text"] else ""
+
+
+def _signature_form(line: str) -> str:
+    """落款行补横线：“投标人：××公司（盖单位章）”的值加下划线，值为空或“＿＿”时留空白横线。"""
+    if UNDERLINE_START in line or "：" not in line:
+        return line
+    label, value = line.split("：", 1)
+    matched = _SIGN_HINT.search(value)
+    hint = matched.group(1) if matched else ""
+    value = value[: len(value) - len(hint)].strip()
+    if re.fullmatch(r"[＿_\s]*", value):
+        value = ""
+    return f"{label}：{underline(value)}{hint}"
+
+
+def _document_title(ctx: ComposeContext) -> str:
+    """封面与页眉的文件名称：采购文件给定“谈判响应文件”等名称时照用，否则为“投标文件”。"""
+    return ctx.tender.get("cover_title") or "投标文件"
 
 
 def _add_cover(document: Document, ctx: ComposeContext, volume_label: str) -> None:
@@ -153,18 +202,22 @@ def _add_cover(document: Document, ctx: ComposeContext, volume_label: str) -> No
         paragraph.paragraph_format.space_before = Pt(before)
         _add_text(paragraph, text, bold=bold, size=size, east_asia=east_asia)
 
+    title = _document_title(ctx)
+    response = title != "投标文件"
     line(ctx.project_name, 18, before=48)
-    line("投  标  文  件", 36, before=60)
+    line("  ".join(title), 36 if len(title) <= 4 else 30, before=60)
     line(f"（{volume_label}）", 18, before=12)
     legal = ctx.profile["legalRep"]["name"]
-    rows = [
-        ("招 标 编 号", ctx.tender_no),
-        ("所 投 分 标", ctx.lot_names),
-        ("分 标 编 号", ctx.lot_codes),
-        ("包　　　号", ctx.package_no),
-        ("投　标　人", f"{ctx.company_name}（盖单位章）"),
+    number_label = "项 目 编 号" if response else "招 标 编 号"
+    if ctx.tender.get("lots") or ctx.tender.get("format_layout") != "integrated":
+        rows = [(number_label, ctx.tender_no), ("所 投 分 标", ctx.lot_names), ("分 标 编 号", ctx.lot_codes), ("包　　　号", ctx.package_no)]
+    else:
+        # 整本招标 / 采购文件没有编号、分标时封面不印编号栏，也不把“招标编号”记入待填清单
+        rows = [(number_label, ctx.tender["tender_no"])] if ctx.tender.get("tender_no") else []
+    rows += [
+        ("供　应　商" if response else "投　标　人", f"{ctx.company_name}（盖单位章）"),
         ("法定代表人或委托代理人", f"{legal or ''}（签字）＿＿＿＿＿＿＿＿" if legal else "（签字）＿＿＿＿＿＿＿＿"),
-        ("投 标 日 期", ctx.sign_date),
+        ("响 应 日 期" if response else "投 标 日 期", ctx.sign_date),
     ]
     spacer = document.add_paragraph()
     spacer.paragraph_format.space_before = Pt(70)
@@ -219,7 +272,9 @@ def _add_header_footer(section, ctx: ComposeContext, volume_label: str) -> None:
     section.different_first_page_header_footer = True
     header = section.header.paragraphs[0]
     header.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    _add_text(header, f"{ctx.company_name}　{ctx.tender_no} 投标文件（{volume_label}）", size=9)
+    # 招标文件没有招标编号时（如整本 EPC 招标文件）页眉用项目名称，不在每页印“待填”标记
+    reference = ctx.tender.get("tender_no") or ctx.tender.get("project_name") or ctx.tender_no
+    _add_text(header, f"{ctx.company_name}　{reference} {_document_title(ctx)}（{volume_label}）", size=9)
     border = OxmlElement("w:pBdr")
     bottom = OxmlElement("w:bottom")
     for key, value in (("w:val", "single"), ("w:sz", "6"), ("w:space", "1"), ("w:color", "000000")):
@@ -297,6 +352,11 @@ def _add_table(document: Document, block: dict, counter: list[int]) -> None:
             _shade(cell, "D9D9D9")
         _repeat_header(word_table.rows[0])
         offset = 1
+    if "merges" in block:
+        _fill_grid_table(word_table, block, widths)
+        spacer = document.add_paragraph()
+        spacer.paragraph_format.line_spacing_rule = WD_LINE_SPACING.SINGLE
+        return
     is_form = bool(block.get("form"))
     for row_index, row in enumerate(rows):
         word_row = word_table.rows[row_index + offset]
@@ -317,6 +377,27 @@ def _add_table(document: Document, block: dict, counter: list[int]) -> None:
                 row.cells[index].width = Cm(width)
     spacer = document.add_paragraph()
     spacer.paragraph_format.line_spacing_rule = WD_LINE_SPACING.SINGLE
+
+
+def _fill_grid_table(word_table, block: dict, widths: list[float]) -> None:
+    """按招标文件版式写入带跨行 / 跨列合并的表单表格。"""
+    labels = {(row, column) for row, column in block["labels"]}
+    anchors = {(top, left) for top, left, _bottom, _right in block["merges"]}
+    for row_index, row in enumerate(block["rows"]):
+        word_row = word_table.rows[row_index]
+        _keep_row_together(word_row)
+        for column_index, text in enumerate(row):
+            cell = word_row.cells[column_index]
+            cell.width = Cm(widths[column_index])
+            position = (row_index, column_index)
+            if not text and position not in anchors:
+                continue
+            is_label = position in labels
+            _write_cell(cell, text, bold=is_label, center=is_label or len(str(text)) <= 8)
+            if is_label:
+                _shade(cell, "F2F2F2")
+    for top, left, bottom, right in block["merges"]:
+        word_table.cell(top, left).merge(word_table.cell(bottom, right))
 
 
 def _add_placeholder(document: Document, block: dict) -> None:
@@ -348,6 +429,9 @@ def _add_placeholder(document: Document, block: dict) -> None:
 def _add_image(document: Document, block: dict) -> None:
     path = Path(block["path"])
     caption = block.get("caption", "")
+    if path.suffix.lower() == ".pdf" and path.is_file():
+        _add_pdf_pages(document, path, caption)
+        return
     if path.suffix.lower() not in IMAGE_SUFFIXES or not path.is_file():
         _add_placeholder(document, {"text": f"（{caption}：原件为 {path.suffix.upper().lstrip('.') or '非图片'} 文件，请在此处粘贴对应页面）", "height": 6})
         return
@@ -359,14 +443,36 @@ def _add_image(document: Document, block: dict) -> None:
     except Exception:  # noqa: BLE001 - 图片损坏时退回占位框，不中断整本生成
         _add_placeholder(document, {"text": f"（{caption}：图片无法读取，请重新上传或在此处粘贴）", "height": 6})
         return
+    _add_picture(document, str(path), ratio, caption)
+
+
+def _add_picture(document: Document, source, ratio: float, caption: str) -> None:
     width = min(MAX_IMAGE_WIDTH_CM, MAX_IMAGE_HEIGHT_CM / max(ratio, 0.01))
     holder = document.add_paragraph()
     holder.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    holder.add_run().add_picture(str(path), width=Cm(width))
+    holder.paragraph_format.keep_with_next = bool(caption)
+    holder.add_run().add_picture(source, width=Cm(width))
     if caption:
         label = document.add_paragraph()
         label.alignment = WD_ALIGN_PARAGRAPH.CENTER
         _add_text(label, caption, size=TABLE_SIZE)
+
+
+def _add_pdf_pages(document: Document, path: Path, caption: str) -> None:
+    """将资料库 PDF 的每一页作为原件页面插入，保留顺序及页面比例。"""
+    try:
+        import fitz
+
+        with fitz.open(path) as report:
+            if report.needs_pass or not report.page_count:
+                raise ValueError("PDF 已加密或没有页面")
+            for index, page in enumerate(report):
+                scale = min(2.0, 2000 / max(page.rect.width, page.rect.height, 1))
+                pixels = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False)
+                label = f"{caption or path.name}（第 {index + 1}/{report.page_count} 页）"
+                _add_picture(document, BytesIO(pixels.tobytes('png')), pixels.height / max(pixels.width, 1), label)
+    except (ImportError, OSError, RuntimeError, ValueError):
+        _add_placeholder(document, {"text": f"（{caption or path.name}：PDF 无法读取，请检查文件是否损坏、加密，或重新上传可读取的原件）", "height": 6})
 
 
 def _add_blocks(document: Document, blocks: list[dict], counter: list[int]) -> None:
@@ -381,7 +487,11 @@ def _add_blocks(document: Document, blocks: list[dict], counter: list[int]) -> N
                 paragraph.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
             if block.get("size"):
                 paragraph.paragraph_format.space_before = paragraph.paragraph_format.space_after = Pt(8)
-            _add_text(paragraph, block["text"], bold=bool(block.get("bold")), size=block.get("size"))
+            form = _paragraph_form(block)
+            if form:
+                _add_form_text(paragraph, form, bold=bool(block.get("bold")), size=block.get("size"))
+            else:
+                _add_text(paragraph, block["text"], bold=bool(block.get("bold")), size=block.get("size"))
         elif kind == "table":
             _add_table(document, block, counter)
         elif kind == "placeholder":
@@ -394,7 +504,7 @@ def _add_blocks(document: Document, blocks: list[dict], counter: list[int]) -> N
                 paragraph.paragraph_format.left_indent = Cm(6.2)
                 paragraph.paragraph_format.space_before = Pt(18 if index == 0 else 6)
                 paragraph.paragraph_format.keep_together = True
-                _add_text(paragraph, line)
+                _add_form_text(paragraph, _signature_form(line))
 
 
 def _add_section(document: Document, section: Section, counter: list[int], first: bool) -> None:
@@ -439,7 +549,8 @@ def render_document(roots: list[Section], ctx: ComposeContext, path: Path, volum
         _add_section(document, root, counter, first=True)
     properties = document.core_properties
     properties.author = properties.last_modified_by = ctx.company["name"] or "投标人"
-    properties.title = f"{ctx.tender_no} 投标文件（{volume_label}）"
+    # 文档属性不是正文：没有招标编号时用项目名称，不产生“待填”
+    properties.title = f"{ctx.tender.get('tender_no') or ctx.tender.get('project_name') or ''} 投标文件（{volume_label}）".strip()
     properties.subject = ctx.tender.get("project_name", "")
     path.parent.mkdir(parents=True, exist_ok=True)
     document.save(str(path))

@@ -21,7 +21,6 @@ STATUS_PARTIAL = "partial"
 STATUS_MISSING = "missing"
 STATUS_MANUAL = "manual"
 STATUS_EXTERNAL = "external"
-SCORE_UNAVAILABLE_MESSAGE = "未识别到适用的评分标准，暂不可评分；请补充包含评分细则的 Word 招标文件后重新解析。"
 
 STATUS_LABELS = {
     STATUS_FULL: "满足（可得最高档）",
@@ -221,26 +220,19 @@ def run_score_check(
     for criterion in criteria:
         sections = located.get(criterion["criterion_id"], [])
         deduction = (criterion["max_score"] or 0) <= 0 and (criterion["min_score"] or 0) < 0
-        review_only = bool(criterion.get("evaluation_mode"))
-        external = not review_only and any(keyword in criterion["factor"] for keyword in _EXTERNAL_FACTORS)
+        external = any(keyword in criterion["factor"] for keyword in _EXTERNAL_FACTORS)
         text = "\n".join(section.plain_text() for section in sections)
         pending = text.count(PENDING_PREFIX)
         placeholders = sum(1 for s in sections for n in s.walk() for b in n.blocks if b["type"] == "placeholder")
         written = [s for s in sections if not headings or re.sub(r"\s+", "", s.heading) in headings]
         estimated, basis, advice = (None, "", [])
-        if review_only:
-            basis = ("报价评分需要有效报价、评标基准价等数据，暂不可估分" if criterion["evaluation_mode"] == "price"
-                     else "已识别招标原表评分标准，尚未核验投标正文和证明材料，需人工评估")
-        elif deduction:
+        if deduction:
             clean = profile["declarations"]["noAdverseRecord"]
             estimated, basis = (0.0, "已出具诚信自查声明：不存在所列扣分情形") if clean else (None, "未声明无不良记录，需逐项核实")
         elif not external:
             estimated, basis, advice = _estimate(criterion, profile, certificates, lots)
         advice = list(advice)
-        if review_only:
-            status = STATUS_MANUAL
-            advice.append("请按原表逐项核验；识别出评分条款不代表已经响应或取得相应分数")
-        elif external:
+        if external:
             status = STATUS_EXTERNAL
             basis = basis or "该项由招标人依据供应商绩效评价 / 历史履约数据评定，投标文件无需单独响应"
         elif not written:
@@ -269,8 +261,7 @@ def run_score_check(
                 "rule": criterion["rule"],
                 "deduction": deduction,
                 "status": status,
-                "statusLabel": "待评估" if review_only else STATUS_LABELS[status],
-                "responseVerified": bool(written) and not review_only,
+                "statusLabel": STATUS_LABELS[status],
                 "estimatedScore": estimated,
                 "basis": basis,
                 "sections": [{"key": s.key, "heading": s.heading} for s in written],
@@ -280,7 +271,7 @@ def run_score_check(
             }
         )
     volumes = []
-    for volume, label in (("business", "商务 / 其他评分"), ("technical", "技术评分"), ("price", "报价评分")):
+    for volume, label in (("business", "商务评分"), ("technical", "技术评分")):
         scoped = [i for i in items if i["volume"] == volume]
         if not scoped:
             continue
@@ -292,23 +283,18 @@ def run_score_check(
                 "total": len(scoped),
                 "counts": {status: sum(1 for i in scoped if i["status"] == status) for status in STATUS_LABELS},
                 "maxScore": sum(i["maxScore"] or 0 for i in scorable),
-                "estimatedScore": (sum(i["estimatedScore"] for i in scorable if i["estimatedScore"] is not None)
-                                   if any(i["estimatedScore"] is not None for i in scorable) else None),
+                "estimatedScore": sum(i["estimatedScore"] or 0 for i in scorable if i["estimatedScore"] is not None),
                 "unestimated": sum(1 for i in scorable if i["estimatedScore"] is None),
                 "externalMaxScore": sum(i["maxScore"] or 0 for i in scoped if i["status"] == STATUS_EXTERNAL),
             }
         )
-    responded = sum(1 for i in items if i["status"] != STATUS_MISSING and
-                    (i["responseVerified"] or i["status"] == STATUS_EXTERNAL))
-    passed = bool(items) and all(i["status"] != STATUS_MISSING for i in items) and not any(c.get("evaluation_mode") for c in criteria)
+    responded = sum(1 for i in items if i["status"] != STATUS_MISSING)
     return {
         "checkedAt": datetime.now().isoformat(timespec="seconds"),
         "items": items,
         "volumes": volumes,
-        "coverage": round(100 * responded / len(items), 1) if items else None,
-        "status": "blocked" if not items else "ready" if passed else "warning",
-        "message": SCORE_UNAVAILABLE_MESSAGE if not items else "",
+        "coverage": round(100 * responded / len(items), 1) if items else 0,
         "expiredCertificates": expired,
         "readBack": bool(headings),
-        "passed": passed,
+        "passed": all(i["status"] != STATUS_MISSING for i in items),
     }

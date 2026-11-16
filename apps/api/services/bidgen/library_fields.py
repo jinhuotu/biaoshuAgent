@@ -70,13 +70,15 @@ ROW_HINTS = {
     "testEquipment": "试验设备|检测设备|检验设备", "equipment": "生产设备|设备清单",
     "performances": "业绩|合同", "patents": "专利", "standards": "标准", "awards": "奖励|成果|获奖",
 }
-
-_YEAR_CELL = re.compile(r"^(?:19|20)\d{2}(?:年|年度|年末)?$")
 CERTIFICATE_SLOTS = {
     "license": "business_license", "business_license": "business_license",
     "legal_id": "legal_id", "agent_id": "agent_id", "id_legal": "legal_id", "id_agent": "agent_id", "tax": "tax",
     "iso9001": "quality_system", "iso14001": "environment_system", "iso45001": "safety_system",
-    "quality": "quality_system", "environment": "environment_system", "safety": "safety_system",
+    "quality": "quality_system", "environment": "environment_system",
+    # 投标资料库页面的槽位（见 tenders/categories.py）；safety 槽位是“安全生产许可证”，不是职业健康安全管理体系
+    "safety": "safety_license", "qualification": "qualification", "bank_permit": "bank_permit",
+    "bond": "bid_bond", "finance": "finance_report", "social": "social_insurance",
+    "perf": "performance_proof", "product": "product_report", "other_materials": "other",
 }
 CERTIFICATE_PATTERNS = {
     "business_license": "营业执照", "legal_id": "法定代表人身份证|法人身份证",
@@ -89,6 +91,11 @@ CERTIFICATE_PATTERNS = {
     "carbon_footprint": "碳足迹", "green_power": "绿色电力证书|绿电证书",
     "production_license": "生产许可证", "ccc": "CCC|强制性产品认证|3C认证",
     "type_test": "型式试验|型式检验", "prequalification": "资格预审.*通知",
+    "safety_license": "安全生产许可证", "qualification": "资质证书",
+    "itss": "信息技术服务管理体系|ISO.?(?:IEC)?.?20000", "isms": "信息安全管理体系|ISO.?(?:IEC)?.?27001",
+    "cmmi": "CMMI|能力成熟度",
+    "bank_permit": "开户许可证|基本存款账户", "bid_bond": "投标保证金|保证金(?:缴存|缴纳)?回单|投标保函",
+    "finance_report": "审计报告|财务报表|完税证明", "social_insurance": "社保|社会保险",
 }
 
 
@@ -97,18 +104,19 @@ def label_key(value: str) -> str:
     return re.sub(r"\s+|\([^)]*\)", "", value).lower()
 
 
-_FINANCE_ROW_LABELS = {
-    label_key(alias): key
-    for key, aliases in ROW_ALIASES["finance"].items()
-    for alias in aliases.split("|")
-}
-
-
 def alias_map(fields: dict) -> dict[str, str]:
     return {label_key(alias): key for key, aliases in fields.items() for alias in aliases.split("|")}
 
 
 def certificate_category(slot: str, title: str) -> str:
+    credit_title = re.sub(r"\s+", "", title)
+    registry = bool(re.search(r"企业信用信息公示|国家企业信用|gsxt\.gov\.cn", credit_title, re.I))
+    china = bool(re.search(r"信用中国|creditchina\.gov\.cn", credit_title, re.I))
+    if registry or china:
+        # 资料库的信用分类标题包含两种来源，不能将全部附件误归到其中一种。
+        return "credit_report" if registry and china else "credit_gsxt" if registry else "credit_china"
+    if slot == "credit" or re.search(r"信用(?:查询|报告|信息报告)|征信报告", credit_title):
+        return "credit_report"
     if slot in CERTIFICATE_SLOTS:
         return CERTIFICATE_SLOTS[slot]
     return next((key for key, pattern in CERTIFICATE_PATTERNS.items() if re.search(pattern, title, re.I)), "")
@@ -149,95 +157,6 @@ def _cells(line: str) -> list[str]:
     return [cell.strip() for cell in re.split(r"\t|\s*\|\s*| {2,}", line.strip().strip("|"))]
 
 
-def _finance_transposed_rows(lines: list[str], title: str) -> list[dict]:
-    """读取“项目 | 2023年 | 2024年 | 2025年”这类纵向财务表。"""
-    values: dict[tuple[str, str], tuple[int, str]] = {}
-    index = 0
-    while index < len(lines):
-        headers = _cells(lines[index])
-        years = [cell for cell in headers[1:] if _YEAR_CELL.fullmatch(cell.replace(" ", ""))]
-        if len(headers) < 3 or len(years) < 2 or not re.search(r"项目|科目|指标", headers[0]):
-            index += 1
-            continue
-        year_columns = headers[1 : len(years) + 1]
-        index += 1
-        while index < len(lines):
-            cells = _cells(lines[index])
-            if len(cells) < len(year_columns) + 1:
-                break
-            label = re.sub(r"^[（(]?(?:其中|其中：|其中:)\s*", "", cells[0]).strip(" ：:")
-            field = _FINANCE_ROW_LABELS.get(label_key(label))
-            if field and field != "year":
-                for year, value in zip(year_columns, cells[1:]):
-                    cleaned = _value(value)
-                    if cleaned:
-                        normalized_year = re.sub(r"年(?:度|末)?$", "", year)
-                        priority = 1 if field == "revenue" and "主营" in label else 0
-                        key = (normalized_year, field)
-                        previous = values.get(key)
-                        if previous is None or priority >= previous[0]:
-                            values[key] = (priority, _money_value(cleaned, label))
-            index += 1
-        continue
-    return [{"year": year, field: value} for (year, field), (_priority, value) in values.items()]
-
-
-def _declaration_title_patch(title: str) -> dict:
-    """只根据资料项标题识别明确的制度或说明文件，不从正文推断企业事实。"""
-    normalized = re.sub(r"\s+", "", title or "")
-    mapping = {
-        "greenPlan": ("绿色发展规划", "绿色低碳发展规划"),
-        "innovationIncentive": ("创新激励", "研发创新激励"),
-        "supplyChainMeasures": ("供应链保障", "供应链风险应对"),
-        "greenRecycling": ("绿色回收", "绿色生产和绿色回收"),
-        "processDocsComplete": ("工艺文件", "工艺管理"),
-        "materialDocsComplete": ("原材料", "组部件管理"),
-        "noStateGridRelation": ("系统人员关系", "国网系统人员关系"),
-        "esgReport": ("ESG报告",),
-        "eiaReport": ("环评报告", "能评报告"),
-        "wasteReport": ("废水废气废固", "废水、废气、废固"),
-    }
-    return {key: True for key, marks in mapping.items() if any(mark in normalized for mark in marks)}
-
-
-def _service_table_patch(lines: list[str], title: str) -> dict:
-    """读取售后服务网点表，避免把多列表头误当成标签和值。"""
-    for index, line in enumerate(lines):
-        headers = _cells(line)
-        normalized = [label_key(cell) for cell in headers]
-        if len(headers) < 3 or not any("服务网点" in cell or "覆盖区域" in cell for cell in normalized):
-            continue
-        region_index = next((i for i, cell in enumerate(normalized) if "覆盖区域" in cell or "省份区域" in cell), None)
-        phone_index = next((i for i, cell in enumerate(normalized) if "服务电话" in cell or "联系电话" in cell), None)
-        if region_index is None and phone_index is None:
-            continue
-        regions, phones = [], []
-        cursor = index + 1
-        while cursor < len(lines):
-            cells = _cells(lines[cursor])
-            if len(cells) < len(headers) or not re.match(r"^\d+$", cells[0]):
-                break
-            if region_index is not None and cells[region_index]:
-                regions.append(cells[region_index])
-            if phone_index is not None and cells[phone_index]:
-                phones.append(cells[phone_index])
-            cursor += 1
-        response = re.search(r"(\d+)\s*小时内响应", "\n".join(lines))
-        arrival = re.search(r"(\d+)\s*小时内到达", "\n".join(lines))
-        patch = {}
-        if regions:
-            patch["provinces"] = "、".join(dict.fromkeys(regions))
-            patch["provinceCount"] = str(len(dict.fromkeys(regions)))
-        if phones:
-            patch["hotline"] = "、".join(dict.fromkeys(phones))
-        if response:
-            patch["responseHours"] = response.group(1)
-        if arrival:
-            patch["arrivalHours"] = arrival.group(1)
-        return patch
-    return {}
-
-
 def _table_group(headers: list[str], title: str) -> tuple[str, dict[int, str]]:
     choices = []
     for group, fields in ROW_ALIASES.items():
@@ -254,12 +173,45 @@ def _table_group(headers: list[str], title: str) -> tuple[str, dict[int, str]]:
     return choices[0][1], choices[0][2]
 
 
+# 有固定格式的字段：OCR 把标签和值拆到不同行时，只接受符合格式的值，避免把“扫描二维码登录”之类的版面文字当成值
+_VALUE_FORMATS = {
+    "creditCode": re.compile(r"^[0-9A-HJ-NPQRTUWXY]{18}$"),
+    "foundedDate": re.compile(r"\d{4}\s*[年./\-]"),
+    "registeredCapital": re.compile(r"[元圆万]"),
+    "postcode": re.compile(r"^\d{6}$"),
+}
+# 可以跨行续写的长字段（证照上的住所、经营范围常折成多行）
+_MULTILINE_KEYS = {"address": 3, "businessScope": 8, "intro": 8}
+# 证照版面上的固定文字，遇到即停止续行
+_LAYOUT_TEXT = re.compile(r"登记机关|国家企业信用|信息公示系统|公示系统|监制|年度报告|二维码|^\d{1,4}$|^[年月日]$|^\(副本\)|^副本")
+
+
+def _join_split_labels(lines: list[str], targets: dict) -> list[str]:
+    """OCR 把竖排或字间距大的标签拆成单字（“名”“称”），能拼成已知标签时合并为一行。"""
+    merged: list[str] = []
+    index = 0
+    while index < len(lines):
+        for size in (4, 3, 2):
+            parts = [line.strip() for line in lines[index:index + size]]
+            if len(parts) == size and all(1 <= len(part) <= 2 for part in parts) and label_key("".join(parts)) in targets:
+                merged.append("".join(parts))
+                index += size
+                break
+        else:
+            merged.append(lines[index])
+            index += 1
+    return merged
+
+
+def _is_id_number(value: str) -> bool:
+    """居民身份证号码校验位（GB 11643）。"""
+    weights = (7, 9, 10, 5, 8, 4, 2, 1, 6, 3, 7, 9, 10, 5, 8, 4, 2)
+    return "10X98765432"[sum(int(digit) * weight for digit, weight in zip(value, weights)) % 11] == value[-1].upper()
+
+
 def extract_profile_fields(*, fields: list[dict], text: str, slot: str, title: str, role: str) -> dict:
     """返回稀疏资料补丁；无法确定的值不进入补丁。"""
     patch: dict = {}
-    declarations = _declaration_title_patch(title)
-    if declarations:
-        patch["declarations"] = declarations
     targets = {alias: (group, key) for group, definitions in FIELD_ALIASES.items() for alias, key in alias_map(definitions).items()}
     person = person_group(slot, title, role)
     if person:
@@ -268,6 +220,9 @@ def extract_profile_fields(*, fields: list[dict], text: str, slot: str, title: s
         targets.update({alias: (person, key) for alias, key in alias_map(PERSON_ALIASES).items()})
     elif slot in {"license", "business_license"}:
         targets["名称"] = ("company", "name")
+        targets["类型"] = ("company", "orgStructure")  # 营业执照的“类型”即企业类型，只在执照上这样取
+    elif slot == "bank_permit":
+        targets["存款人名称"] = ("company", "name")
 
     def add(label: str, raw: object) -> None:
         target = targets.get(label_key(label))
@@ -275,6 +230,10 @@ def extract_profile_fields(*, fields: list[dict], text: str, slot: str, title: s
         if not target or not value:
             return
         group, key = target
+        if key in _VALUE_FORMATS and not _VALUE_FORMATS[key].search(value):
+            return
+        if key == "address" and not re.search(r"[省市区县镇乡路街道巷号]", value):
+            return  # 版面上紧跟“地址”的菜单、按钮文字不是地址
         if key == "foundedDate":
             value = normalize_date(value)
         if group == "declarations":
@@ -308,13 +267,7 @@ def extract_profile_fields(*, fields: list[dict], text: str, slot: str, title: s
                     row[key] = _money_value(row[key], headers[index])
             patch.setdefault(group, []).append(row)
 
-    lines = text.splitlines()
-    transposed_finance = _finance_transposed_rows(lines, title)
-    if transposed_finance:
-        patch["finance"] = transposed_finance
-    service = _service_table_patch(lines, title)
-    if service:
-        patch["service"] = service
+    lines = _join_split_labels([line for line in text.splitlines() if line.strip()], targets)
     table_group, table_mapping, table_headers = "", {}, []
     for index, line in enumerate(lines):
         cells = _cells(line)
@@ -336,15 +289,32 @@ def extract_profile_fields(*, fields: list[dict], text: str, slot: str, title: s
         pairs = re.split(r"[：:]", line, maxsplit=1)
         if len(pairs) == 2:
             add(pairs[0], pairs[1])
-        if len(cells) % 2 == 0 and len(cells) <= 6:
-            labels = [label_key(cells[column]) for column in range(0, len(cells), 2)]
-            if all(label in targets for label in labels):
-                for column in range(0, len(cells), 2):
-                    add(cells[column], cells[column + 1])
+        for column in range(0, len(cells) - 1, 2):
+            add(cells[column], cells[column + 1])
         if len(cells) == 1 and label_key(line) in targets and index + 1 < len(lines):
-            following = lines[index + 1].strip()
-            if label_key(following) not in targets and not re.search(r"[:：\t|]", following):
-                add(line, following)
+            key = targets[label_key(line)][1]
+            following = [item.strip() for item in lines[index + 1:index + 4]]
+            candidates = [item for item in following if label_key(item) not in targets and not re.search(r"[:：\t|]", item)]
+            if key in _VALUE_FORMATS:
+                # 标签与值之间可能隔着版面文字：取后面几行中第一个格式正确的值
+                value = next((item for item in candidates if _VALUE_FORMATS[key].search(item)), "")
+            elif following and following[0] in candidates:
+                value = following[0]
+                for extra in lines[index + 2:index + 1 + _MULTILINE_KEYS.get(key, 1)]:
+                    extra = extra.strip()
+                    if label_key(extra) in targets or _LAYOUT_TEXT.search(extra) or re.search(r"[:：\t|]", extra):
+                        break
+                    value += extra
+            else:
+                value = ""
+            if value:
+                add(line, value)
         if len(pairs) == 2 and label_key(pairs[0]) in {"智能制造系统", "已应用的智能制造系统软件", "信息化系统"}:
             patch["systems"] = [value.strip() for value in re.split(r"[、,，;；]", pairs[1]) if value.strip()]
+    if person and not patch.get(person, {}).get("idNumber"):
+        # OCR 常把“公民身份号码”和号码连成一行、中间没有分隔：证件上校验位正确的唯一号码即身份证号
+        id_numbers = {number.upper() for number in re.findall(r"(?<![0-9A-Za-z])\d{17}[\dXx](?![0-9A-Za-z])", text)
+                      if _is_id_number(number)}
+        if len(id_numbers) == 1:
+            patch.setdefault(person, {})["idNumber"] = id_numbers.pop()
     return patch

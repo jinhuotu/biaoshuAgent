@@ -10,8 +10,11 @@ from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from api.services.bidgen.archive import ArchiveEntry, flatten_entries
-from api.services.bidgen.docx_reader import DocBlock, blocks_to_text, read_docx_blocks
+from api.services.bidgen.archive import ARCHIVE_SUFFIXES, ArchiveEntry, flatten_entries
+from api.services.bidgen.docx_reader import DocBlock, blocks_to_text, read_docx_blocks, template_paragraph
+from api.services.bidgen.pdf_reader import read_pdf_blocks
+from api.services.bidgen.integrated_parser import is_integrated_document, parse_integrated_document
+from api.services.bidgen.project_facts import extract_project_facts
 
 ROLE_INVITATION = "invitation"
 ROLE_MAIN = "main"
@@ -67,7 +70,6 @@ class ScoreCriterion:
     max_score: float | None
     rule: str
     tiers: list[dict] = field(default_factory=list)
-    evaluation_mode: str = ""  # manual/price：仅自查，不能套用电缆估分或生成规则
 
 
 @dataclass
@@ -126,6 +128,11 @@ class TenderInfo:
     key_clauses: list[dict] = field(default_factory=list)
     criteria: list[ScoreCriterion] = field(default_factory=list)
     format_items: list[FormatItem] = field(default_factory=list)
+    # "integrated"：格式目录取自整本招标文件的格式章节，按原文顺序编排，不分商务 / 技术两卷
+    format_layout: str = ""
+    format_source: str = ""  # "list"：目录来自须知中“商务标书 / 技术标书应包括下列内容”的清单，没有格式章节
+    cover_title: str = ""  # 格式章节封面上的文件名称，如“谈判响应文件”“投标文件”
+    project_facts: dict = field(default_factory=dict)  # 整本招标文件的项目事实，供技术标编写器使用
     tech_specs: list[TechSpec] = field(default_factory=list)
     contract_clauses: list[dict] = field(default_factory=list)
     files: list[dict] = field(default_factory=list)
@@ -148,7 +155,7 @@ def _clean(text: str) -> str:
 
 def classify_entry(entry: ArchiveEntry, blocks: list[DocBlock] | None) -> str:
     """按文件名、所在压缩包层级与正文特征判定文件角色。"""
-    if entry.suffix == ".zip":
+    if entry.suffix in ARCHIVE_SUFFIXES:
         return ROLE_ARCHIVE
     if entry.suffix == ".sign":
         return ROLE_SIGNATURE
@@ -161,6 +168,8 @@ def classify_entry(entry: ArchiveEntry, blocks: list[DocBlock] | None) -> str:
     if re.search(r"投标邀请书|招标公告", entry.name):
         return ROLE_INVITATION
     if re.search(r"招标文件|投标人须知|评标办法", entry.name) or "投标人须知" in head_text:
+        return ROLE_MAIN
+    if blocks and is_integrated_document(blocks):
         return ROLE_MAIN
     if "投标邀请书" in head_text[:200]:
         return ROLE_INVITATION
@@ -334,82 +343,6 @@ def _criteria_from_table(table: DocBlock, volume: str, category: str, prefix: st
     return result
 
 
-def _engineering_scoring(blocks: list[DocBlock]) -> list[ScoreCriterion]:
-    """工程类四列前附表：条款号、评分组、要素、标准，支持跨表续行。
-
-    只取明确标注的分值，不把资格审查、汇总分值或公式中的数值当作得分项。
-    """
-    result: list[ScoreCriterion] = []
-    active, group, volume, clause = False, "", "", ""
-    group_start = 0
-    span = re.compile(r"(?<![\d.])(\d+(?:\.\d+)?)\s*[-~～－—–]\s*(\d+(?:\.\d+)?)\s*分")
-    maximum = re.compile(r"[（(]\s*(\d+(?:\.\d+)?)\s*分\s*[）)]")
-    for block in blocks:
-        if block.kind != "table":
-            active = False
-            continue
-        for row in block.rows:
-            if len(row) != 4:
-                active = False
-                continue
-            number, heading, factor, rule = [_clean(c) for c in row]
-            compact = re.sub(r"\s+", "", heading)
-            if number == "条款号":
-                active = "评分标准" in rule
-                continue
-            if not active:
-                continue
-            if number.startswith("注"):
-                for item in result[group_start:]:
-                    item.rule += "\n" + " ".join(c for c in row if c)
-                continue
-            if heading:
-                group, clause = compact, number
-                group_start = len(result)
-                if "投标报价" in compact:
-                    volume = "price"
-                elif any(key in compact for key in ("承包人建议书", "设计组织技术措施", "实施方案", "技术评分")):
-                    volume = "technical"
-                elif any(key in compact for key in ("商务评分", "其他评分因素")):
-                    volume = "business"
-                else:
-                    volume = ""
-            if not volume:
-                continue
-            # 报价档只取要素标题的满分，不能从基准价公式中猜分值。
-            match = maximum.search(factor) if volume == "price" else span.search(rule or factor)
-            if match is None:
-                if not factor and rule and result and result[-1].group == group:
-                    result[-1].rule += "\n" + rule
-                continue
-            if volume == "price":
-                low, high = 0.0, float(match.group(1))
-                title = maximum.sub("", factor).strip()
-            else:
-                low, high = float(match.group(1)), float(match.group(2))
-                if low > high:
-                    continue
-                # 子项的分值在第四列时使用原文描述，避免把上一级合计再计一次。
-                title = span.sub("", rule or factor).strip(" ：:；;")
-            if not title:
-                continue
-            result.append(ScoreCriterion(
-                criterion_id=f"E-{len(result) + 1:02d}", volume=volume, category="",
-                group=group, factor=title, min_score=low, max_score=high,
-                rule=f"条款 {clause}；" + "\n".join(c for c in (factor, rule) if c),
-                evaluation_mode="price" if volume == "price" else "manual",
-            ))
-    return result
-
-
-def read_scoring_criteria(paths: list[Path]) -> list[dict]:
-    """只重新解析评分标准，供旧任务重新生成时补齐；不修改其他解析结果。"""
-    info = TenderInfo()
-    blocks = [block for path in paths for block in read_docx_blocks(path)]
-    _parse_scoring(blocks, info)
-    return [asdict(item) for item in info.criteria]
-
-
 def _parse_scoring(blocks: list[DocBlock], info: TenderInfo) -> None:
     pending: tuple[str, str] | None = None
     technical_index = 0
@@ -433,9 +366,6 @@ def _parse_scoring(blocks: list[DocBlock], info: TenderInfo) -> None:
         prefix = "B" if volume == "business" else f"T{technical_index}"
         info.criteria.extend(_criteria_from_table(block, volume, category, prefix))
         pending = None
-
-    if not info.criteria:
-        info.criteria.extend(_engineering_scoring(blocks))
 
     by_name = {lot.lot_name: lot for lot in info.lots}
     weights = next(
@@ -545,7 +475,7 @@ def _attach_format_templates(blocks: list[DocBlock], info: TenderInfo) -> None:
             continue
         body = sections[-1][2]
         if block.kind == "paragraph":
-            body.append({"kind": "paragraph", "text": block.text})
+            body.append(template_paragraph(block))
         else:
             body.append({"kind": "table", "rows": block.rows})
     for item in info.format_items:
@@ -637,7 +567,14 @@ def parse_tender_package(entries: list[ArchiveEntry], workspace: Path, archive_n
             except ValueError as exc:
                 note = str(exc)
                 info.warnings.append(note)
-        elif entry.suffix in (".doc", ".pdf", ".wps"):
+        elif entry.suffix == ".pdf":
+            try:
+                blocks = read_pdf_blocks(workspace / entry.storage_path)
+                note = "PDF 文件已按文字识别解析；表格无框线时可能识别不全，请核对评分标准与格式目录。"
+            except ValueError as exc:
+                note = str(exc)
+                info.warnings.append(note)
+        elif entry.suffix in (".doc", ".wps"):
             note = "该格式暂不解析，已保留原件；如为关键文件请另存为 .docx 后重新上传。"
         role = classify_entry(entry, blocks)
         info.files.append(
@@ -666,17 +603,24 @@ def parse_tender_package(entries: list[ArchiveEntry], workspace: Path, archive_n
     if main_blocks:
         _parse_key_clauses(main_blocks, info)
         _parse_scoring(main_blocks, info)
-        _parse_format_directory(main_blocks, info)
-        if not info.criteria:
-            info.warnings.append("未识别到评分标准，暂不可评分；请确认招标文件包含完整评分细则。")
+        legacy_format = _find_table(main_blocks, "提交方式", "格式要求") is not None
+        if legacy_format:
+            _parse_format_directory(main_blocks, info)
+        parse_integrated_document(main_blocks, info, legacy_format=legacy_format)
+        if info.format_layout == "integrated":
+            info.project_facts = extract_project_facts(main_blocks, info)
+        if not info.format_items:
+            info.warnings.append("未在招标文件中找到“投标文件格式目录”，将按通用货物类投标文件结构编排。")
     else:
         info.warnings.append("未识别到招标文件正文（投标人须知 / 评标办法 / 投标文件格式），评分自查与格式编排将受限。")
     if not info.project_name:
-        info.warnings.append("未识别到投标邀请书中的项目名称，请在项目信息中手工补充。")
+        info.warnings.append("未识别到招标文件中的项目名称，请在项目信息中手工补充。")
     if not info.validity_days:
-        info.validity_days = 90
-        info.warnings.append("未识别到投标有效期，暂按 90 日处理，请核对。")
-    if info.bid_deadline:
+        # 原文写了天数却没取到，与原文根本没有规定有效期，是两回事
+        stated = re.search(r"(?:投标|响应)(?:文件)?有效期[^。\n]{0,30}?\d+\s*(?:个)?(?:日历天|日|天)", blocks_to_text(main_blocks))
+        info.warnings.append("未识别到投标有效期，请核对原文并手工补充。" if stated or not main_blocks
+                             else "未识别到投标有效期：招标文件没有规定有效期天数，证件效期按投标截止日校验；招标方另有要求时请手工补充。")
+    if info.bid_deadline and info.validity_days:
         deadline = datetime.fromisoformat(info.bid_deadline)
         info.validity_end = (deadline + timedelta(days=info.validity_days)).date().isoformat()
     info.tech_specs.sort(key=lambda spec: spec.fixed_id)
