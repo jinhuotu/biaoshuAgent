@@ -279,13 +279,24 @@ def _exclude_other_people(parsed: list, current: dict, previous: dict, warnings:
             excluded.update(document.public_id for document, _person in people)
             warnings.append(f"资料库包含多位{label}，请先填写本次使用的姓名或身份证号并重新匹配。")
             continue
+        anonymous = []
         for document, person in people:
             name, identity = person.get("name", ""), person.get("idNumber", "")
-            if ((selected_name and name and selected_name != name)
+            if not name and not identity:
+                anonymous.append(document)
+            elif ((selected_name and name and selected_name != name)
                     or (selected_id and identity and selected_id != identity)
-                    or (selected_name and not name and identity and identity != selected_id)
-                    or (len(people) > 1 and not name and not identity)):
+                    or (selected_name and not name and identity and identity != selected_id)):
                 excluded.add(document.public_id)
+        # 身份证反面只有签发机关和有效期限，没有姓名、证号：本组只涉及一个人时归这个人，
+        # 涉及多人时无法确定归属，不贴并提示，避免把别人的反面贴进来。
+        identified = [document for document, person in people
+                      if person.get("name") or person.get("idNumber")]
+        single_person = not any(document.public_id in excluded for document in identified)
+        if len(people) > 1 and anonymous and (not identified or not single_person):
+            excluded.update(document.public_id for document in anonymous)
+            warnings.append(f"资料库中{label}的部分资料（如身份证反面）未识别到姓名或证号，无法确定属于哪一位，"
+                            "未自动贴入；请在资料库中按人分开存放后重新匹配。")
     return excluded
 
 

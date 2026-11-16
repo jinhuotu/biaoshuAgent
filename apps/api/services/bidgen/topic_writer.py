@@ -36,6 +36,50 @@ _PLATFORM_MEASURES: tuple[tuple[str, str], ...] = (
     (r"账号|用户数", "系统不按用户数限制授权，账号数量不设上限，可随业务需要自行增加。"),
     (r"低代码|二次开发", "平台内置低代码配置工具，表单、流程、报表、看板可由贵方人员配置扩展；提供二次开发规范与培训，配置内容随系统升级保留。"),
 )
+# 功能清单条目的“我方响应”：(功能名称/招标要求关键词, 实现方式)。先按功能名称、再按招标要求匹配，
+# 自上而下首个命中生效，具体的写法排在笼统的前面。{erp} 由招标文件点名的 ERP 替换；招标文件未提及 ERP 时，
+# 含 {erp} 的分句整句去掉，不虚构集成。
+_FUNCTION_RESPONSES: tuple[tuple[str, str], ...] = (
+    (r"领料|退料|领退料|补料", "工单领料、退料、补料与超额领用审批联动库存过账，同步回传{erp}"),
+    (r"投料|防错|防呆", "投料前强制校验物料、批次、效期、库存与配方用量，不符合即阻断并提示原因"),
+    (r"齐套|缺料", "按工单BOM与实时库存自动齐套分析，缺料清单推送采购与仓储，齐套后方可下达"),
+    (r"派工", "支持按产线、班组、人员三级派工，任务推送至工位一体机与PDA，支持优先级调整与临时插单"),
+    (r"排产|排程|APS|甘特", "基于产能、BOM与工艺路线自动排程，甘特图拖拽调整，冲突实时提示，确认后下发派工"),
+    (r"工单|生产订单|生产计划", "订单下发、接收、拆分与状态流转（下达/投产/完工/关闭）全流程管理，完工与报废数量实时回传{erp}"),
+    (r"SOP|作业指导|图纸", "按工单与工序自动调取SOP、图纸与参数标准，版本随工艺变更更新，可记录查阅与确认"),
+    (r"报工|工序流转|过站", "工位扫码报工，自动记录人员、设备、工时与数量，报工数据实时回传{erp}核算"),
+    (r"包装|装箱|箱码", "按包装规则生成箱码，扫码装箱校验产品与数量，箱码与产品码父子关联可追溯"),
+    (r"条码|标签|二维码|编码规则", "统一标签模板中心，各类编码规则集中维护，打印记录可追溯，模板变更留痕"),
+    (r"追溯", "以批次/序列号为主线记录投料、工序、设备、人员与检验结果，支持正向与反向一键追溯"),
+    (r"不合格|不良|返工|返修|让步|报废", "不合格品自动触发评审，按返工、返修、让步接收、报废分流处置，处置结果关联批次并纳入质量统计"),
+    (r"SPC|过程能力|控制图|CPK", "关键参数实测值自动生成控制图并计算CPK等过程能力指数，超出控制限即时预警"),
+    (r"检验|质检|首检|巡检|IQC|IPQC|OQC|FQC", "检验方案按物料、工序、产品配置检验项目与上下限，检验任务按到货、报工自动生成，实测值录入后自动判定"),
+    (r"点检|保养|维保", "按设备类型配置点检、保养计划，到期自动生成任务推送责任人，扫码签到后逐项填报，超期自动提醒"),
+    (r"维修|报修|故障", "现场扫码报修，维修工单自动派发，记录故障原因、处理过程、备件消耗与停机时长，统计MTBF/MTTR"),
+    (r"备件|备品", "备件按安全库存与上下限管理，领用与维修工单关联，低于安全库存自动预警"),
+    (r"OEE|稼动|设备效率", "按设备采集运行、停机与产量数据，自动计算时间开动率、性能开动率、合格率与OEE"),
+    (r"模具|工装|治具|夹具", "工装模具唯一编码建档，记录领用、使用次数与保养，寿命到期自动预警"),
+    (r"设备台账|设备档案|设备管理", "设备按编码建档，记录型号、位置、责任人、技术参数与文档，运行/停机/维修状态实时更新"),
+    (r"能耗|能源|水电气", "按车间、产线、设备采集水电气能耗，按产量计算单耗，超标自动预警"),
+    (r"数据采集|数采|IoT|物联|PLC|SCADA", "通过采集网关对接PLC与仪表，数据经清洗、换算后按设备与参数存储，供报工、追溯与看板调用"),
+    (r"安灯|异常|呼叫", "工位一键呼叫安灯，按异常类型与等级推送责任人，超时逐级升级，处理结果经确认后闭环"),
+    (r"盘点", "支持全盘、动态盘点与循环盘点，PDA扫码盘点，差异自动生成调整单，审批后过账"),
+    (r"调拨|移库|转库", "调拨、移库扫码执行，在途库存可追踪，库位与批次变更实时更新"),
+    (r"配送|线边|叫料", "工位按工单需求叫料，系统生成配送任务，扫码交接签收，线边库存实时更新"),
+    (r"出库|发货|拣货|拣选", "按出库单生成拣货任务，PDA扫码校验物料与批次，遵循先进先出，出库数据实时回传{erp}"),
+    (r"入库|收货|上架", "到货扫码收货，按检验结果上架入库，系统按规则推荐库位，入库数据实时回传{erp}"),
+    (r"库位|货位|仓库建模|库区", "按仓库、库区、库位三级建模，库位容量与存放规则可配置，库存精确到库位与批次"),
+    (r"库存|效期|呆滞|安全库存", "按物料设置安全库存、上下限与效期规则，临期、呆滞与超储自动预警"),
+    (r"委外|外协", "委外工序发料、收货、检验全程跟踪，委外进度与费用实时可查"),
+    (r"工艺路线|BOM|工艺参数|配方", "工艺路线、BOM与工艺参数版本化管理，变更走审批并记录前后差异，工单下达时锁定有效版本"),
+    (r"人员|技能|资质|考勤|绩效", "人员技能与上岗资质建档，派工、报工时校验资质，工时自动汇总用于绩效统计"),
+    (r"看板|大屏|可视化", "看板组件化配置数据源、刷新频率与布局，车间大屏、电视与PC多端展示，异常数据高亮"),
+    (r"报表|统计|分析", "内置报表设计器，按时间、产线、产品、班组多维钻取，可导出Excel/PDF并按角色授权"),
+    (r"预警|消息|通知|提醒", "规则引擎配置触发条件与通知对象，站内信、移动端推送多渠道通知，处理过程留痕"),
+    (r"移动端|APP|PDA|手持", "PDA、手机端与PC端共用同一业务服务，扫码作业网络中断时本地暂存，恢复后自动补传"),
+    (r"权限|角色|用户|账号", "采用“用户—角色—权限”模型，权限细化到菜单、按钮与数据范围，关键操作全程留痕"),
+)
+_INTEGRATION_TARGETS = re.compile(r"ERP|WMS|MES|QMS|SRM|PLM|OA|IoT|SCADA|EAM|APS", re.I)
 
 
 def _p(text: str) -> dict:
@@ -74,6 +118,26 @@ class ListedWriter:
         phases = Counter(item.get("attrs", {}).get("上线阶段", "") for item in module["items"])
         phases.pop("", None)
         return phases.most_common(1)[0][0] if phases else ""
+
+    def function_response(self, label: str, requirement: str) -> str:
+        """功能清单条目的“我方响应”：写清怎么实现，不写空洞的“满足”。"""
+        response = next((answer for source in (label, requirement)
+                         for pattern, answer in _FUNCTION_RESPONSES if re.search(pattern, source, re.I)), "")
+        if not response and _INTERFACE_WORDS.search(label + requirement):
+            targets = _join(dict.fromkeys(name.upper() if name.lower() != "iot" else "IoT"
+                                          for name in _INTEGRATION_TARGETS.findall(label + requirement))) or "外部系统"
+            response = f"通过统一接口服务与{targets}对接，接口具备鉴权、幂等、失败重试与日终对账，交互过程全程记录日志"
+        if not response:
+            note = next(iter(tech_notes(label + requirement, limit=1)), "")
+            if note:
+                response = re.match(r"[^。；]+", note).group(0)
+        if not response:
+            self.confirm(f"功能响应表中“{label}”未匹配到实现说明，已按通用表述编写，请补充具体实现方式")
+            return f"在系统中按招标要求实现{label}，相关规则与参数可配置，业务数据实时记录、可查询可追溯"
+        if self.erp:
+            return response.replace("{erp}", self.erp)
+        # 招标文件未提及 ERP：去掉含 {erp} 的分句，不虚构集成
+        return re.sub(r"，[^，]*\{erp\}[^，]*", "", response)
 
     def phase_modules(self, phase: str) -> list[str]:
         return [module["title"] for module in self.modules if self.phase_of(module) == phase]
@@ -126,10 +190,11 @@ class ListedWriter:
         ]
         letter = [
             title_line("授权委托书"),
-            paragraph(f"致：{self.owner}", indent=False),
-            _p(f"本人{ctx.value(legal['name'], '法定代表人姓名')}系{ctx.company_name}的法定代表人，现授权{ctx.value(agent['name'], '委托代理人姓名')}"
-               f"（身份证号：{ctx.value(agent['idNumber'], '委托代理人身份证号')}，职务：{agent['title'] or '—'}）为我方代理人，"
-               f"以我方名义参加{self.project}的投标活动。代理人在投标、开标、评标、合同谈判及签约过程中所签署的一切文件和处理的一切有关事务，我方均予以承认。"),
+            paragraph(f"致：{underline(self.owner)}", indent=False),
+            _p(f"本人{underline(ctx.value(legal['name'], '法定代表人姓名'))}系{underline(ctx.company_name)}的法定代表人，"
+               f"现授权{underline(ctx.value(agent['name'], '委托代理人姓名'))}"
+               f"（身份证号：{underline(ctx.value(agent['idNumber'], '委托代理人身份证号'))}，职务：{underline(agent['title'])}）为我方代理人，"
+               f"以我方名义参加{underline(self.project)}的投标活动。代理人在投标、开标、评标、合同谈判及签约过程中所签署的一切文件和处理的一切有关事务，我方均予以承认。"),
             _p("本授权书自签署之日起生效，至本项目投标活动及合同签订事宜全部结束时止。代理人无转委托权。"),
             ctx.signature_block("法定代表人（签字或盖章）：＿＿＿＿＿＿＿＿", "委托代理人（签字）：＿＿＿＿＿＿＿＿"),
             *certificate_blocks(ctx, ("agent_id",), "委托代理人身份证正、反面扫描件"),
@@ -272,10 +337,12 @@ class ListedWriter:
             product.append(_p(f"我方产品已在{_join(str(case.get('buyer', '')) for case in cases[:5])}等客户成功应用，案例详见商务标书。"))
         children = [("产品成熟度与应用情况", product)]
         for module in self.modules:
-            rows = [[str(index), entry["label"], entry["text"], entry.get("attrs", {}).get("上线阶段", "—"), "满足"]
+            rows = [[str(index), entry["label"], entry["text"], entry.get("attrs", {}).get("上线阶段", "—"),
+                     self.function_response(entry["label"], entry["text"])]
                     for index, entry in enumerate(module["items"], start=1)]
             blocks = [_p(f"{module['title']}共{len(rows)}项功能，我方逐项响应如下："),
-                      table(["序号", "功能模块", "招标要求", "上线阶段", "响应"], rows, caption=f"{module['title']}功能响应表", widths=[1.2, 3.4, 8.6, 1.8, 1.4])]
+                      table(["序号", "功能模块", "招标文件要求", "上线阶段", "我方响应"], rows, caption=f"{module['title']}功能响应表",
+                            widths=[1.2, 2.8, 5.2, 1.6, 5.6])]
             notes = tech_notes(node_text(module) + module["title"])
             if notes:
                 blocks.append(_p("实现要点：" + "".join(notes)))
@@ -290,7 +357,7 @@ class ListedWriter:
                 ["可用性", "关键服务冗余部署，故障自动切换；数据定时备份、定期恢复演练"],
             ], caption="技术性能设计", widths=[3.0, 13.4]),
         ]))
-        return Draft(blocks=[_p("我方以招标文件“重点项目明细”为基线，对各板块功能逐项响应，全部满足。")] if self.modules else [], children=children)
+        return Draft(blocks=[_p("我方以招标文件“重点项目明细”为基线，对各板块功能逐项说明实现方式，全部纳入建设范围。")] if self.modules else [], children=children)
 
     def implementation_service(self, item: dict, criteria: list[dict]) -> Draft:
         stages = [

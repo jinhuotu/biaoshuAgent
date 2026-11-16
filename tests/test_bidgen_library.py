@@ -192,6 +192,36 @@ def test_different_people_are_never_combined(tmp_path):
     assert selected["legalRep"]["phone"] == ""
 
 
+def test_agent_id_back_without_name_is_kept_for_the_single_agent(tmp_path):
+    front, back = tmp_path / "front.png", tmp_path / "back.png"
+    front.write_bytes(b"front")
+    back.write_bytes(b"back")
+    docs = [document("front", title="授权代理人身份证", slot="id_agent", role="person/legal",
+                     fields={"姓名": "代理人甲", "身份证号": "999999199001010001"}, path=front),
+            document("back", title="授权代理人身份证", slot="id_agent", role="person/legal",
+                     fields={"签发机关": "某县公安局", "有效期限": "2020.01.01-2040.01.01"}, path=back)]
+    result = match(ProfileStore(tmp_path, 1), docs)
+    agent_ids = [c["libraryDocumentId"] for c in result["profile"]["certificates"] if c["category"] == "agent_id"]
+    assert sorted(agent_ids) == ["back", "front"]
+    assert result["profile"]["agent"]["name"] == "代理人甲"
+
+
+def test_unattributable_id_back_is_not_pasted_when_several_agents(tmp_path):
+    scan = tmp_path / "scan.png"
+    scan.write_bytes(b"scan")
+    docs = [document("a", title="授权代理人身份证", slot="id_agent", role="person/legal", fields={"姓名": "甲某", "身份证号": "A-ID"}, path=scan),
+            document("b", title="授权代理人身份证", slot="id_agent", role="person/legal", fields={"姓名": "乙某", "身份证号": "B-ID"}, path=scan),
+            document("back", title="授权代理人身份证", slot="id_agent", role="person/legal", fields={"签发机关": "某县公安局"}, path=scan)]
+    store = ProfileStore(tmp_path, 1)
+    profile = store.load()
+    profile["agent"]["name"] = "甲某"
+    store.save(profile)
+    result = match(store, docs)
+    agent_ids = [c["libraryDocumentId"] for c in result["profile"]["certificates"] if c["category"] == "agent_id"]
+    assert agent_ids == ["a"]
+    assert any("无法确定属于哪一位" in warning for warning in result["libraryMatch"]["warnings"])
+
+
 def test_multiple_certificates_keep_stable_distinct_ids(tmp_path):
     store = ProfileStore(tmp_path, 1)
     profile = store.load()
