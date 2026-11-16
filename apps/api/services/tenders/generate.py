@@ -373,6 +373,7 @@ def generate_bid(
         "materialIntentComplete": brief.materialIntentComplete,
         "scoringUniqueness": scoring_quality,
         "scoringGeneration": scoring_generation,
+        "headingStyleReport": getattr(brief, '_heading_style_report', {}),
     }
     if vol == "technical":
         out["techDocxFile"] = dest.name

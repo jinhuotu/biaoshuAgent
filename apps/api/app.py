@@ -19,6 +19,7 @@ from api.routers import (
     ai,
     audit,
     auth,
+    bid_gen,
     health,
     knowledge,
     layouts,
@@ -175,6 +176,7 @@ def create_app() -> FastAPI:
     app.include_router(tenders.router, prefix=settings.api_prefix)
     app.include_router(tender_package.router, prefix=settings.api_prefix)
     app.include_router(cablepkg.router, prefix=settings.api_prefix)
+    app.include_router(bid_gen.router, prefix=settings.api_prefix)
     app.include_router(quotes.router, prefix=settings.api_prefix)
     app.include_router(workflows.router, prefix=settings.api_prefix)
     app.include_router(ai.router, prefix=settings.api_prefix)

@@ -239,13 +239,15 @@ def toc_title_key(text: str) -> str:
 
 
 def bid_item_title(title: str) -> str:
+    from api.services.tenders.title_cleanup import strip_title_tail
+
     t = (title or "").strip()
     t = re.sub(r"^附(?:件)?[（(]?[一二三四五六七八九十0-9]+[)）]?[：:、.\s]*", "", t)
     t = _DOC_TAIL.sub("", t).strip(" ：:、")
     n = compact_title(t)
     if "营业执照" in n and ("注册地址" in n or "注册住所" in n):
         return "营业执照"
-    return t or (title or "").strip()
+    return strip_title_tail(t or (title or "").strip())
 
 
 def _peel_form_suffix(title: str) -> str:

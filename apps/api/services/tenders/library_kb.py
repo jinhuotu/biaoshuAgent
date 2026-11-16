@@ -1209,6 +1209,8 @@ async def list_slots_status_kb(
 async def resolve_attachments(
     db: AsyncSession,
     slots: list[PlaceholderItem],
+    *,
+    report: dict | None = None,
 ) -> dict[str, list[Path]]:
     try:
         base = await get_base_by_public_id(db, TENDER_LIB_PUBLIC_ID)
@@ -1220,7 +1222,9 @@ async def resolve_attachments(
         if _is_material_parent(document):
             parents.setdefault(key_from_tags(document.tags),[]).append(document)
     children = _group_children(docs)
-    from api.services.tenders.material_identity import material_key_aliases
+    from api.services.tenders.material_identity import (
+        material_key_aliases, material_title_similarity, same_material_title,
+    )
     from api.services.tenders.match import (
         material_sources, material_match_rejection, normalize_material_title,
         _kind_hits, _titles_loosely_match,
@@ -1228,8 +1232,17 @@ async def resolve_attachments(
 
     methods = {}
     rejected = {}
+    title_scores = {}
+    candidate_counts = {}
+
+    def note_candidate(key, parent):
+        if report is not None:
+            counts = candidate_counts.setdefault(key, {})
+            if parent.public_id not in counts:
+                counts[parent.public_id] = len(_files_of(parent, children.get(parent.public_id, [])))
 
     def compatible_files(item, parent):
+        note_candidate(item.key, parent)
         candidate = PlaceholderItem(key=key_from_tags(parent.tags), title=parent.name or '')
         reason = material_match_rejection(item.title, item.hint, candidate)
         if reason:
@@ -1274,12 +1287,14 @@ async def resolve_attachments(
         # Unfamiliar invitation requests use one standard storage container,
         # with explicit per-file request metadata rather than isolated parents.
         if not paths:
+            title_aliases = []
             for parent in parents.get('other_materials', []):
                 for child in children.get(parent.public_id, []):
                     tags = child.tags or []
                     title = next((str(tag).removeprefix('material-title:') for tag in tags
                                   if str(tag).startswith('material-title:')), '')
-                    if ('material-key:' + key in tags or title and _norm_material_title(title) == _norm_material_title(item.title)):
+                    if ('material-key:' + key in tags) or (title and same_material_title(item.title, title)):
+                        note_candidate(key, parent)
                         candidate = PlaceholderItem(key='', title=title or child.name)
                         if material_match_rejection(item.title, item.hint, candidate):
                             continue
@@ -1290,8 +1305,15 @@ async def resolve_attachments(
                             continue
                         path = _doc_file_path(child)
                         if path:
-                            paths.append(path)
+                            if 'material-key:' + key in tags:
+                                paths.append(path)
+                            else:
+                                title_aliases.append((material_title_similarity(item.title, title), path))
                             methods[key] = '标题别名'
+            if not paths and title_aliases:
+                score, path = min(title_aliases, key=lambda row: (-row[0], row[1].as_posix()))
+                paths = [path]
+                title_scores[key] = score
         if not paths and _KEY_RE.match(key) and not groups:
             paths = list_slot_files(key)
             requested_sources = material_sources(item.title + ' ' + item.hint)
@@ -1308,10 +1330,15 @@ async def resolve_attachments(
         if not key or out.get(key):
             continue
         wanted=_norm_material_title(item.title)
+        best_title = None
         for parent in (p for group in parents.values() for p in group):
             for child in children.get(parent.public_id,[]):
                 title=next((str(t).removeprefix('material-title:') for t in (child.tags or []) if str(t).startswith('material-title:')), '')
                 candidate=_norm_material_title(title or child.name)
+                if report is not None and candidate and (
+                    candidate == wanted or same_material_title(item.title, title or child.name)
+                ):
+                    note_candidate(key, parent)
                 if material_match_rejection(item.title, item.hint, PlaceholderItem(key='', title=title or child.name)):
                     continue
                 requested_sources = material_sources(item.title + ' ' + item.hint)
@@ -1319,10 +1346,16 @@ async def resolve_attachments(
                 if requested_sources and (not candidate_sources or not candidate_sources <= requested_sources):
                     rejected.setdefault(key, set()).add('来源不符')
                     continue
-                if candidate and (candidate==wanted or (len(wanted)>=6 and (wanted in candidate or candidate in wanted))):
+                if candidate and (candidate == wanted or same_material_title(item.title, title or child.name)):
                     path=_doc_file_path(child)
                     if path:
-                        out.setdefault(key,[]).append(path)
+                        score = material_title_similarity(item.title, title or child.name)
+                        rank = (-score, path.as_posix())
+                        if best_title is not None and rank >= best_title:
+                            continue
+                        best_title = rank
+                        out[key] = [path]
+                        title_scores[key] = score
                         methods[key] = '标题别名'
                         logging.getLogger(__name__).info('material title fallback key=%s source_parent=%s',key,parent.public_id)
         if not out.get(key):
@@ -1345,17 +1378,29 @@ async def resolve_attachments(
         borrowed=[]
         for candidate,files in by_title.items():
             source_item = PlaceholderItem(key='', title=candidate)
+            if report is not None and (
+                candidate == title or same_material_title(item.title, candidate) or find_catalog_item([source_item], title=item.title, hint=item.hint) is not None
+            ):
+                for group in parents.values():
+                    for parent in group:
+                        if re.sub(r'\s+', '', parent.name or '') == candidate:
+                            note_candidate(key, parent)
             reason = material_match_rejection(item.title, item.hint, source_item)
             if reason:
                 rejected.setdefault(key, set()).add(reason)
                 continue
-            if candidate==title or find_catalog_item([source_item],title=item.title,hint=item.hint) is not None:
+            if candidate==title or same_material_title(item.title, candidate) or find_catalog_item([source_item],title=item.title,hint=item.hint) is not None:
                 for group in parents.values():
                     for parent in group:
                         if re.sub(r'\s+', '', parent.name or '') == candidate:
                             borrowed.extend(compatible_files(item, parent))
-                methods[key] = '来源借用' if material_sources(title + ' ' + item.hint) else (
-                    '标题别名' if _titles_loosely_match(item.title, candidate) else '同族类别')
+                methods[key] = ('父条目标题别名' if candidate != title and find_catalog_item(
+                    [source_item], title=item.title, hint=item.hint) is None else (
+                    '来源借用' if material_sources(title + ' ' + item.hint) else (
+                        '标题别名' if _titles_loosely_match(item.title, candidate) else '同族类别')))
+                if borrowed and methods[key] == '父条目标题别名':
+                    logger.info('material parent title alias key=%s sim=%s', key,
+                                round(material_title_similarity(item.title, candidate), 3))
         if borrowed:
             out[key] = borrowed
     from api.services.tenders.material_identity import material_key_aliases, unique_material_files
@@ -1366,6 +1411,11 @@ async def resolve_attachments(
         groups.setdefault(canonical, []).append(key)
     hashes = {}
     for canonical, keys in groups.items():
+        if report is not None:
+            counts = {parent_id: count for key in keys
+                      for parent_id, count in candidate_counts.get(key, {}).items()}
+            for key in keys:
+                candidate_counts[key] = dict(counts)
         ordered = [canonical, *(key for key in keys if key != canonical)]
         paths = unique_material_files(
             (path for key in ordered for path in out.get(key, [])), cache=hashes
@@ -1382,10 +1432,17 @@ async def resolve_attachments(
         reasons = sorted(rejected.get(item.key, set()))
         if not out.get(item.key):
             reasons.append('抽取丢词' if not _kind_hits(item.title) and _kind_hits(item.hint) else '字面不符')
-        logger.info('material match key=%s normalized=%s fileCount=%s method=%s candidates=%s reasons=%s',
+        if report is not None:
+            report[item.key] = {
+                'candidates': sum(candidate_counts.get(item.key, {}).values()),
+                'accepted': len(out.get(item.key, [])),
+                'method': methods.get(item.key, '未命中'),
+                'reasons': list(dict.fromkeys(reasons)),
+            }
+        logger.info('material match key=%s normalized=%s fileCount=%s method=%s candidates=%s reasons=%s score=%.3f',
                     item.key, normalize_material_title(item.title), len(out.get(item.key, [])),
                     methods.get(item.key, '未命中') if out.get(item.key) else '未命中', candidates,
-                    reasons if not out.get(item.key) else [])
+                    reasons if not out.get(item.key) else [], title_scores.get(item.key, 0.0))
     return out
 
 def _norm_material_title(text: str) -> str:

@@ -17,6 +17,7 @@ from api.services.tenders.technical_package import key,text
 from api.services.tenders.format_rules import peel_toc_lead
 from api.services.tenders.outline import subset_toc_titles
 from api.services.tenders.schema import OutlineItem
+from api.services.tenders.title_cleanup import is_section_heading, strip_title_tail, typeset_body
 
 logger = logging.getLogger("api.tenders.technical_render")
 
@@ -516,6 +517,46 @@ def render(doc,brief):
     machine_removed = _clean_machine_paragraphs(doc)
     chapter_titles, point_titles = _package_display_titles(package)
     notes=[]
+
+    def upgrade_section(heading, original_text, ordinal):
+        if len(original_text) > 40:
+            notes.append(f"技术小节标题排版跳过：原段落超过40字，需人工核对：{original_text[:40]}")
+            return
+        props = heading._p.get_or_add_pPr()
+        if props.find(qn('w:numPr')) is None and not is_section_heading(heading.text):
+            _replace_paragraph_text(heading, f'（{ordinal}）' + heading.text)
+        # A distinct semantic style lets final layout retain child alignment.
+        section_style = 'Technical Section Heading'
+        if section_style not in doc.styles:
+            from docx.enum.style import WD_STYLE_TYPE
+
+            style = doc.styles.add_style(section_style, WD_STYLE_TYPE.PARAGRAPH)
+            style.base_style = (doc.styles['List Paragraph'] if heading.style.name
+                                in {'Heading 1', 'Heading 2'} else heading.style)
+        heading.style = section_style
+        outline = props.find(qn('w:outlineLvl'))
+        if outline is None:
+            outline = OxmlElement('w:outlineLvl')
+            props.append(outline)
+        outline.set(qn('w:val'), '1')
+        for run in heading.runs:
+            run.bold = True
+            run.font.size = Pt(min(14, max(12, brief.documentFormat.bodySizePt + 2)))
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+        heading.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        heading.paragraph_format.space_before = Pt(6)
+        heading.paragraph_format.space_after = Pt(6)
+        indent = props.find(qn('w:ind'))
+        if indent is None:
+            indent = OxmlElement('w:ind')
+            props.append(indent)
+        for attribute in ('hanging', 'hangingChars', 'leftChars', 'rightChars'):
+            indent.attrib.pop(qn('w:' + attribute), None)
+        for attribute in ('left', 'right', 'firstLine', 'firstLineChars'):
+            indent.set(qn('w:' + attribute), '0')
+        for tabs in list(props.findall(qn('w:tabs'))):
+            props.remove(tabs)
     if machine_removed:
         notes.append(f"技术卷已清理评分提示语 {machine_removed} 段")
     if not brief.techAnonymous:
@@ -555,7 +596,7 @@ def render(doc,brief):
             if head is None:
                 raise ValueError('技术评分章未找到落位：'+chapter['title'])
             head.style = 'Heading 1'
-            _replace_paragraph_text(head, _clean(chapter_titles[chapter['title']], brief))
+            _replace_paragraph_text(head, strip_title_tail(_clean(chapter_titles[chapter['title']], brief)))
             _bookmark_paragraph(head, f'toc_technical_chapter_{chapter_index}')
             cursor=head._p
             display_title = chapter_titles.get(chapter['title'], chapter['title'])
@@ -592,17 +633,18 @@ def render(doc,brief):
                 schedule_point, rows = _schedule_from_prose(chapter_points, duration)
                 if not rows:
                     notes.append(f"技术卷进度表缺项：{head.text}缺少可对应的阶段、工作、时间安排和核验证据")
-            for point in chapter_points:
+            for point_index, point in enumerate(chapter_points, 1):
                 el=OxmlElement('w:p'); cursor.addnext(el); sub=Paragraph(el,doc)
                 sub.style=_child_heading_style(doc, head)
                 from api.services.tenders.assemble import _run
                 _run(
                     sub,
-                    _clean(point_titles[point['id']], brief),
+                    strip_title_tail(_clean(point_titles[point['id']], brief)),
                     size=None,
                     bold=False,
                     font=brief.documentFormat.fontName,
                 )
+                upgrade_section(sub, point['title'], point_index)
                 cursor=el
                 body = point['body']
                 for ref, bare in numbered_refs.items():
@@ -634,17 +676,18 @@ def render(doc,brief):
         if uniqueness['severe_count'] > 0:
             notes.append('内容重复度超标')
         prune_unreferenced_images(doc)
+        logger.info('technical body typeset: %s', typeset_body(doc, brief.documentFormat))
         return notes
-    for point in package['sections']:
+    for point_index, point in enumerate(package['sections'], 1):
         marker='technical_'+point['id']
         head_marker='toc_technical_'+point['id']
         heading=next((p for p in paragraphs if _title_key(p.text)==_title_key(point['title']) and 'PAGEREF' not in p._p.xml),None)
         if heading is None:
             raise ValueError('技术要点未找到原版落位：'+point['title'])
-        _replace_paragraph_text(heading, point_titles.get(point.get('id'), point['title']))
-        # The legacy technical slicer promotes short numbered list entries to
-        # top-level headings. Keep their original list/indent/font properties;
-        # the dedicated TOC rows carry the requested child hierarchy instead.
+        original_text = heading.text
+        original_num = heading._p.pPr.find(qn('w:numPr')) if heading._p.pPr is not None else None
+        original_num = deepcopy(original_num) if original_num is not None else None
+        _replace_paragraph_text(heading, strip_title_tail(point_titles.get(point.get('id'), point['title'])))
         if key(point['title']) in source_props:
             current=heading._p.pPr
             original=source_props[key(point['title'])]
@@ -652,6 +695,12 @@ def render(doc,brief):
             if signature(current)!=signature(original):
                 if current is not None:heading._p.remove(current)
                 if original is not None:heading._p.insert(0,deepcopy(original))
+        if original_num is not None:
+            props = heading._p.get_or_add_pPr()
+            for numbered in list(props.findall(qn('w:numPr'))):
+                props.remove(numbered)
+            props.append(original_num)
+        upgrade_section(heading, original_text, point_index)
         if head_marker not in markers:_bookmark_paragraph(heading,head_marker)
         if marker in markers:continue
         end=_after(doc,heading._p,point['body'],brief)
@@ -711,9 +760,30 @@ def render(doc,brief):
     if uniqueness['severe_count'] > 0:
         notes.append('内容重复度超标')
     prune_unreferenced_images(doc)
+    logger.info('technical body typeset: %s', typeset_body(doc, brief.documentFormat))
     return notes
 
 
 def sync_toc(doc,brief):
     from api.services.tenders.technical_toc import sync
     return sync(doc, brief)
+
+
+def restore_technical_layout(doc):
+    """Restore only explicitly formatted technical paragraphs after final layout."""
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+    for paragraph in doc.paragraphs:
+        if paragraph.style.name == 'Technical Section Heading':
+            paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            continue
+        if paragraph.style.name not in {'Normal', 'List Paragraph', 'Body Text'}:
+            continue
+        props = paragraph._p.pPr
+        indent = props.find(qn('w:ind')) if props is not None else None
+        if indent is None or indent.get(qn('w:firstLineChars')) != '200':
+            continue
+        if any(list(paragraph._p.iter(qn('w:' + tag)))
+               for tag in ('drawing', 'pict', 'fldChar', 'instrText', 'fldSimple')):
+            continue
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY

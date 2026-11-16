@@ -750,12 +750,20 @@ def _cap_sign_gap(para) -> None:
 
 
 def _embed_in_place(doc: Document, host, files: list[Path], *, pair: bool, key: str = '') -> bool:
-    """Legacy adapter: insert after the complete body block, never into runs."""
-    from api.services.tenders.placeholders import _drop_after
-    from api.services.tenders.schema import PlaceholderItem
+    """Compatibility entry: a missing owned anchor never appends pictures."""
+    from api.services.tenders.placeholders import (
+        attach_media_at_anchor, drop_trailing_orphan_images, find_material_anchor,
+    )
     if not key:
         raise ValueError('A material key is required for block insertion')
-    return _drop_after(doc,host,PlaceholderItem(key=key,title='身份证扫描件' if pair else key),files,complete=True,at_marker=True)
+    anchor = find_material_anchor(doc, key)
+    if anchor is None:
+        return False
+    inserted = attach_media_at_anchor(doc, anchor[0], files, key=key)
+    logger.info('material anchor key=%s rule=%s inserted=%s', key, anchor[1], inserted)
+    if inserted:
+        drop_trailing_orphan_images(doc, {key})
+    return bool(inserted)
 
 
 def _paste_id_pages(doc: Document, brief, media: dict | None, *, global_pasted: set[str] | None = None) -> list[str]:
@@ -798,6 +806,10 @@ def _paste_id_pages(doc: Document, brief, media: dict | None, *, global_pasted: 
                 return
             _dash_after(doc, para, key, title or n)
             notes.append(f"截件有{title or n}，未贴上{who}的扫描件")
+            return
+        from api.services.tenders.placeholders import find_material_anchor
+        if find_material_anchor(doc, key) is None:
+            notes.append(f"资料「{key}」未找到落位锚点，已保留占位框，请人工粘贴")
             return
         if not _embed_in_place(doc, para._p, files, pair=True, key=key):
             if "此处粘贴" in n or "在此粘贴" in n:
@@ -870,7 +882,7 @@ def _paste_id_pages(doc: Document, brief, media: dict | None, *, global_pasted: 
         for key in ("id_legal",):
             files = _files_for(key)
             if files:
-                notes.append("截件没有法定代表人身份证标题，未贴扫描件")
+                notes.append(f"资料「{key}」未找到落位锚点，已保留占位框，请人工粘贴")
     return notes
 
 
@@ -5174,6 +5186,10 @@ def _paste_scan_boxes(doc: Document, media: dict | None) -> list[str]:
             if not files:
                 notes.append(f"缺{label}，已保留原占位")
                 continue
+            from api.services.tenders.placeholders import find_material_anchor
+            if find_material_anchor(doc, key) is None:
+                notes.append(f"资料「{key}」未找到落位锚点，已保留占位框，请人工粘贴")
+                continue
             if not _embed_in_place(doc, el, files, pair=False, key=key):
                 notes.append(f"缺{label}，已保留原占位")
                 continue
@@ -5198,10 +5214,38 @@ def _attach_library(
         global_pasted: 全局已贴集合，跨所有贴图函数共享
     """
     from api.services.tenders.scan_placement import place_library_scans
+    from api.services.tenders.placeholders import (
+        _ANCHOR_WORDS, attach_media_at_anchor, drop_trailing_orphan_images, find_material_anchor,
+    )
 
-    notes, placed = place_library_scans(doc, brief, media, slots, global_pasted=global_pasted, volume=volume)
+    notes, attempted, anchored = [], set(), set()
+    if volume != 'technical':
+        for key in _ANCHOR_WORDS:
+            files = list((media or {}).get(key) or [])
+            if not files or key in (global_pasted or ()):
+                continue
+            if key == 'id_agent' and not getattr(brief, 'authEnabled', False):
+                continue
+            attempted.add(key)
+            anchor = find_material_anchor(doc, key)
+            if anchor is None:
+                notes.append(f"资料「{key}」未找到落位锚点，已保留占位框，请人工粘贴")
+                continue
+            n = attach_media_at_anchor(doc, anchor[0], files, key=key)
+            logger.info('material anchor key=%s rule=%s inserted=%s', key, anchor[1], n)
+            notes.append(f'material anchor key={key} rule={anchor[1]} inserted={n}')
+            if n:
+                anchored.add(key)
+            errors = getattr(doc.element, '_material_anchor_issues', {}).get(key, [])
+            if errors or not n:
+                notes.append(f"资料「{key}」未能全部插入，已保留占位框，请人工粘贴：" + '、'.join(errors or ['未插入图片']))
+        drop_trailing_orphan_images(doc, anchored)
+    legacy_notes, placed = place_library_scans(
+        doc, brief, media, slots, skip_keys=attempted, global_pasted=global_pasted, volume=volume)
+    notes.extend(legacy_notes)
+    placed.update(anchored)
     if handled is not None:
-        handled.update(placed)
+        handled.update(placed | attempted)
     if global_pasted is not None:
         global_pasted.update(placed)
     return notes

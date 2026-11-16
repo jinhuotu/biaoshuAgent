@@ -3780,6 +3780,9 @@ def finalize_body_layout(doc, fmt=None):
     changed += _align_business_signoffs(doc)
     notes.extend('SIGNOFF_NEEDS_REVIEW paragraph=' + path
                  for block in getattr(doc.element, '_signoff_audit', []) for path in block['pending'])
+    if 'Technical Section Heading' in doc.styles:
+        from api.services.tenders.technical_render import restore_technical_layout
+        restore_technical_layout(doc)
     return changed
 
 

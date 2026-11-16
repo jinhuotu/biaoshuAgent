@@ -965,7 +965,13 @@ def append_section_materials(doc, slots, media, keys, excluded=(), skip_keys=(),
     ratio=fallback_count/len(plans) if plans else 0
     if ratio>=.05:
         notes.append(f'警告：资料归属兜底 {fallback_count}/{len(plans)}（{ratio:.1%}），请核对章节识别')
-    notes.append(f"资料落位核对：{report['expected']} 项，输出 {report['outputs']} 项，未满足 {report['unmet']}")
+    img = sum(row['img'] for row in report['rows'])
+    box = sum(row['box'] for row in report['rows'])
+    notes.append(f"资料落位核对：{report['expected']} 项，实件 {img} 项，占位 {box} 项，未满足 {report['unmet']}")
+    if box > 0:
+        titles = [row.get('title') or row['key'] for row in report['rows'] if row['box'] > 0]
+        notes.append('以下资料仍为占位，需人工核对：' + '、'.join(titles[:5])
+                     + (f'等 {len(titles)} 项' if len(titles) > 5 else ''))
     logger.info('material phases demands=%s pending=%s img=%s box=%s fallback=%s fallback_ratio=%.4f plan_seconds=%.4f render_seconds=%.4f coverage_seconds=%.4f total_seconds=%.4f',len(plans),len(pending),sum(r['img'] for r in report['rows']),sum(r['box'] for r in report['rows']),fallback_count,ratio,planned-started,rendered-planned,perf_counter()-rendered,perf_counter()-started)
     handled.update(old for old,new in aliases.items() if new in handled)
     return notes,handled

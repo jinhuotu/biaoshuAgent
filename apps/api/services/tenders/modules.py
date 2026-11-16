@@ -46,8 +46,9 @@ from api.services.tenders.placeholders import (
     _insert_slot_media,
     _set_row_height,
     draw_placeholder_box,
-    id_slot,
-    inline_id_scans,
+    attach_media_at_anchor,
+    drop_trailing_orphan_images,
+    find_material_anchor,
 )
 from api.services.tenders.schema import BidBrief, OutlineItem, PerformanceLine, PlaceholderItem
 from api.services.tenders.tables import resolve_dev_layout, resolve_quote_layout, width_ratios
@@ -290,15 +291,21 @@ def _legal_id(
     attach = _para(doc, "附：法定代表人身份证明复印件或扫描件。")
     attach.paragraph_format.keep_with_next = True
     notes: list[str] = []
-    n = inline_id_scans(
-        doc,
-        (media or {}).get("id_legal") if media else None,
-        empty_slot=id_slot("id_legal"),
-    )
+    key = 'id_legal'
+    anchor = find_material_anchor(doc, key)
+    n = attach_media_at_anchor(doc, anchor[0], list((media or {}).get(key) or [])) if anchor else 0
+    if anchor:
+        from api.services.tenders.placeholders import logger
+        logger.info('material anchor key=%s rule=%s inserted=%s', key, anchor[1], n)
+    if not anchor:
+        notes.append(f"资料「{key}」未找到落位锚点，已保留占位框，请人工粘贴")
+    elif not n:
+        notes.append(f"资料「{key}」未能插入，已保留占位框，请人工粘贴")
     if inlined is not None:
         inlined.add("id_legal")
     if n:
         notes.append("法人身份证已写入身份证明页")
+        drop_trailing_orphan_images(doc, {key})
     _id_sign_block(doc, brief)
     return notes
 
@@ -347,15 +354,21 @@ def _auth(
         notes.append("授权委托书未填写委托代理人，已按法定代表人亲自签署处理")
         _auth_sign_block(doc, brief)
         return notes
-    n = inline_id_scans(
-        doc,
-        (media or {}).get("id_agent") if media else None,
-        empty_slot=id_slot("id_agent"),
-    )
+    key = 'id_agent'
+    anchor = find_material_anchor(doc, key)
+    n = attach_media_at_anchor(doc, anchor[0], list((media or {}).get(key) or [])) if anchor else 0
+    if anchor:
+        from api.services.tenders.placeholders import logger
+        logger.info('material anchor key=%s rule=%s inserted=%s', key, anchor[1], n)
+    if not anchor:
+        notes.append(f"资料「{key}」未找到落位锚点，已保留占位框，请人工粘贴")
+    elif not n:
+        notes.append(f"资料「{key}」未能插入，已保留占位框，请人工粘贴")
     if inlined is not None:
         inlined.add("id_agent")
     if n:
         notes.append("委托人身份证已写入授权委托书")
+        drop_trailing_orphan_images(doc, {key})
     _auth_sign_block(doc, brief)
     return notes
 

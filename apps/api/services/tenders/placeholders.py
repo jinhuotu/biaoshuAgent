@@ -488,6 +488,261 @@ def id_slot(key: str) -> PlaceholderItem:
     return PlaceholderItem(key=key, title=title)
 
 
+_ANCHOR_WORDS = {
+    'id_legal': ('身份证', '身份证明'),
+    'id_agent': ('代理人身份证', '授权'),
+    'license': ('营业执照',),
+    'bank_permit': ('开户许可证', '基本账户'),
+    'finance': ('财务报表', '审计报告'),
+    'bond': ('保证金', '保函'),
+}
+
+
+def find_material_anchor(document, key: str) -> tuple[object, str] | None:
+    """Find a short, owned attachment note outside the document directory."""
+    words = _ANCHOR_WORDS.get(key, ())
+    if not words:
+        return None
+    paragraphs = list(document.paragraphs)
+    excluded, directory = set(), False
+    from api.services.tenders.technical_toc import _regions
+
+    excluded.update(node for region in _regions(document) for host in region for node in host.iter())
+    for paragraph in paragraphs:
+        if ''.join(paragraph.text.split()) == '目录':
+            directory = True
+        elif directory and re.match(r'^(?:Heading|标题)\s*\d', paragraph.style.name):
+            directory = False
+        if directory:
+            excluded.add(paragraph._p)
+
+    def matches(paragraph):
+        text = ''.join(paragraph.text.split())
+        if paragraph._p in excluded or len(text) > 40 or not any(word in text for word in words):
+            return False
+        if key == 'id_legal' and any(word in text for word in ('代理人', '授权', '委托')):
+            return False
+        return True
+
+    def hit(paragraph, rule):
+        owners = getattr(document.element, '_material_anchor_keys', {})
+        owners[paragraph._p] = key
+        document.element._material_anchor_keys = owners
+        return paragraph, rule
+
+    for paragraph in paragraphs:
+        if matches(paragraph) and '附' in paragraph.text:
+            return hit(paragraph, 'attachment-note')
+    for index, paragraph in enumerate(paragraphs):
+        if not matches(paragraph):
+            continue
+        nearby = [paragraph]
+        if index + 1 < len(paragraphs):
+            next_paragraph = paragraphs[index + 1]
+            if next_paragraph._p.getprevious() is paragraph._p and next_paragraph._p not in excluded:
+                nearby.append(next_paragraph)
+        if any(not p.text.strip() or any(word in p.text for word in ('此处粘贴', '在此粘贴', '复印件', '扫描件'))
+               for p in nearby):
+            return hit(paragraph, 'keyword-placeholder')
+    # Preserve the former identity locator as the final owned-section fallback.
+    if key in {'id_legal', 'id_agent'}:
+        anchor, _ = _locate_note(document, id_slot(key), set(), list(excluded))
+        if anchor is not None and anchor not in excluded and anchor.tag == qn('w:p'):
+            return hit(Paragraph(anchor, document._body), 'id-slot')
+    return None
+
+
+def attach_media_at_anchor(document, anchor_paragraph, files: list[Path], *, key: str | None = None,
+                           max_width_cm: float = 15.5) -> int:
+    """Insert readable images at the anchor, never via a document-end buffer."""
+    from docx.image.image import Image as DocxImage
+    from docx.section import Section
+    from PIL import Image
+
+    anchor = anchor_paragraph._p
+    if anchor.getparent() is not document.element.body:
+        raise ValueError('Material anchor must be a body paragraph')
+    explicit_key = key is not None
+    key = key or getattr(document.element, '_material_anchor_keys', {}).get(anchor, '')
+    prefix = 'material_anchor_' + hashlib.sha256(key.encode()).hexdigest()[:16] + '_'
+    existing = [p for p in document.paragraphs if key and any(
+        node.get(qn('w:name'), '').startswith(prefix) for node in p._p.iter(qn('w:bookmarkStart')))]
+    if existing:
+        return sum(len(list(p._p.iter(qn('w:drawing')))) for p in existing)
+    section_props = None
+    node = anchor
+    while node is not None:
+        section_props = node.find('w:pPr/w:sectPr', node.nsmap)
+        if section_props is not None:
+            break
+        node = node.getnext()
+    section_props = section_props if section_props is not None else document.element.body.sectPr
+    section = Section(section_props, document.part)
+    width = min(max_width_cm, (section.page_width - section.left_margin - section.right_margin
+                              - (section.gutter or 0)) / _EMU_PER_CM)
+    height = (section.page_height - section.top_margin - section.bottom_margin) / _EMU_PER_CM - 0.5
+    if width <= 0 or height <= 0:
+        raise ValueError('No printable area at material anchor')
+    prepared, errors = [], []
+    source_rids = getattr(document.element, '_material_anchor_source_rids', {})
+    for source in files:
+        source = Path(source)
+        try:
+            if key:
+                from api.services.tenders.match import material_content_check
+
+                slot = next((item for item in DEFAULT_SLOTS if item.key == key),
+                            PlaceholderItem(key=key, title=key))
+                rejection = material_content_check(slot, source)['reason']
+                if rejection:
+                    errors.append(source.name + '（' + rejection + '）')
+                    continue
+            if source.suffix.lower() == '.pdf':
+                import fitz
+
+                with fitz.open(source) as pdf:
+                    if not len(pdf):
+                        raise ValueError('Empty PDF')
+                    for page in pdf:
+                        pixmap = page.get_pixmap(dpi=220, alpha=False)
+                        prepared.append((source, pixmap.tobytes('png'), pixmap.width, pixmap.height))
+            else:
+                blob = source.read_bytes()
+                if key:
+                    for rid, relation in document.part.rels.items():
+                        if (not relation.is_external and relation.reltype.endswith('/image')
+                                and relation.target_part.blob == blob):
+                            source_rids[rid] = key
+                with Image.open(io.BytesIO(blob)) as image:
+                    image.load()
+                    if key in {'id_legal', 'id_agent'}:
+                        image = _normalize_id_image(image, force_landscape=True)
+                        stream = io.BytesIO()
+                        image.save(stream, format='PNG')
+                        blob = stream.getvalue()
+                    else:
+                        try:
+                            DocxImage.from_blob(blob)
+                        except Exception:
+                            stream = io.BytesIO()
+                            image.save(stream, format='PNG')
+                            blob = stream.getvalue()
+                    image_width, image_height = image.size
+                prepared.append((source, blob, image_width, image_height))
+        except Exception as exc:
+            errors.append(source.name + '（' + type(exc).__name__ + '）')
+            logger.warning('material anchor file failed key=%s source=%s error=%s', key, source, type(exc).__name__)
+    inserted, cursor = 0, anchor
+    placeholder = any(word in anchor_paragraph.text for word in ('此处粘贴', '在此粘贴'))
+    original_text_nodes = list(anchor.iter(qn('w:t')))
+    bookmark_id = max((int(n.get(qn('w:id'), '0')) for n in document.element.body.iter(qn('w:bookmarkStart'))
+                       if n.get(qn('w:id'), '0').isdigit()), default=0) + 1
+    identity = explicit_key and key in {'id_legal', 'id_agent'}
+    pair = identity and len(prepared) == 2
+    if pair:
+        target_width = max(6.5, (width - 0.6) / 2)
+    elif identity:
+        target_width = max(9.0, 6.5)
+    elif explicit_key:
+        target_width = 14.0
+    else:
+        target_width = width
+    groups = [prepared] if pair else [[item] for item in prepared]
+    for group in groups:
+        reuse = placeholder and not errors and inserted == 0
+        paragraph = anchor_paragraph if reuse else Paragraph(OxmlElement('w:p'), document._body)
+        if not reuse:
+            cursor.addnext(paragraph._p)
+        try:
+            for position, (source, blob, image_width, image_height) in enumerate(group):
+                if position:
+                    paragraph.add_run('　')
+                if identity:
+                    shown_width = target_width
+                else:
+                    shown_width = min(target_width, height * image_width / image_height)
+                if not identity and shown_width * image_height / image_width > 20:
+                    shown_width = 20 * image_width / image_height
+                paragraph.add_run().add_picture(io.BytesIO(blob), width=Cm(shown_width))
+                inserted += 1
+        except Exception as exc:
+            if not reuse:
+                paragraph._p.getparent().remove(paragraph._p)
+            errors.append(group[0][0].name + '（' + type(exc).__name__ + '）')
+            continue
+        if reuse:
+            for text in original_text_nodes:
+                text.text = ''
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        paragraph.paragraph_format.left_indent = Cm(0)
+        paragraph.paragraph_format.right_indent = Cm(0)
+        paragraph.paragraph_format.first_line_indent = Cm(0)
+        indent = paragraph._p.get_or_add_pPr().find(qn('w:ind'))
+        for attribute in ('firstLineChars', 'hanging', 'hangingChars', 'leftChars', 'rightChars'):
+            indent.attrib.pop(qn('w:' + attribute), None)
+        paragraph.paragraph_format.line_spacing = 1
+        paragraph.paragraph_format.space_before = paragraph.paragraph_format.space_after = Pt(3)
+        paragraph.paragraph_format.keep_together = True
+        if key:
+            names = [prefix + str(inserted - len(group) + offset) for offset in range(len(group))]
+            if inserted == len(group):
+                names.append('result_' + hashlib.sha256(key.encode()).hexdigest()[:20] + '_img')
+            for name in names:
+                start = OxmlElement('w:bookmarkStart')
+                start.set(qn('w:name'), name)
+                start.set(qn('w:id'), str(bookmark_id))
+                end = OxmlElement('w:bookmarkEnd')
+                end.set(qn('w:id'), str(bookmark_id))
+                paragraph._p.extend([start, end])
+                bookmark_id += 1
+        cursor = paragraph._p
+    issues = getattr(document.element, '_material_anchor_issues', {})
+    issues[key] = errors
+    document.element._material_anchor_issues = issues
+    document.element._material_anchor_source_rids = source_rids
+    return inserted
+
+
+def drop_trailing_orphan_images(document, placed_keys: set[str]) -> int:
+    """Remove only duplicate tail images whose successful owner is evidenced."""
+    owners = {rid: key for rid, key in getattr(document.element, '_material_anchor_source_rids', {}).items()
+              if key in placed_keys}
+    protected = set()
+    placed_tokens = {'result_' + hashlib.sha256(key.encode()).hexdigest()[:20] + '_img'
+                     for key in placed_keys}
+    for key in placed_keys:
+        prefix = 'material_anchor_' + hashlib.sha256(key.encode()).hexdigest()[:16] + '_'
+        legacy_token = 'result_' + hashlib.sha256(key.encode()).hexdigest()[:20] + '_img'
+        for paragraph in document.paragraphs:
+            names = [n.get(qn('w:name'), '') for n in paragraph._p.iter(qn('w:bookmarkStart'))]
+            owned = any(name.startswith(prefix) for name in names)
+            if owned or legacy_token in names:
+                if owned:
+                    protected.add(paragraph._p)
+                for blip in paragraph._p.iter(qn('a:blip')):
+                    owners[blip.get(qn('r:embed'))] = key
+    removed = 0
+    for paragraph in document.paragraphs[-20:]:
+        if paragraph._p in protected or paragraph.text.strip():
+            continue
+        if len(list(paragraph._p.iter(qn('w:drawing')))) != 1:
+            continue
+        legacy_owners = {n.get(qn('w:name'), '') for n in paragraph._p.iter(qn('w:bookmarkStart'))
+                         if n.get(qn('w:name'), '').startswith('result_')
+                         and n.get(qn('w:name'), '').endswith('_img')}
+        if legacy_owners - placed_tokens:
+            continue
+        if any(list(paragraph._p.iter(qn('w:' + tag)))
+               for tag in ('sectPr', 'br', 'pict', 'object', 'fldChar', 'pBdr')):
+            continue
+        rids = [n.get(qn('r:embed')) for n in paragraph._p.iter(qn('a:blip'))]
+        if len(rids) == 1 and owners.get(rids[0]) in placed_keys:
+            paragraph._p.getparent().remove(paragraph._p)
+            removed += 1
+    logger.info('material trailing orphan cleanup removed=%s', removed)
+    return removed
+
+
 def inline_id_scans(
     doc: Document,
     files: list[Path] | None,
@@ -808,6 +1063,19 @@ def _drop_after(doc: Document, anchor_el, slot: PlaceholderItem, files: list[Pat
     from api.services.tenders.directory_guard import assert_insertable
     from api.services.tenders.match import material_content_check
     files = [path for path in files if not material_content_check(slot, path)['reason']]
+    if files and slot.key in _ANCHOR_WORDS:
+        anchor = find_material_anchor(doc, slot.key)
+        if anchor is None:
+            logger.warning('资料「%s」未找到落位锚点，已保留占位框，请人工粘贴', slot.key)
+            # Keep the old placeholder-only path when no source frame exists.
+            # The recursive call has no media and can never append pictures.
+            return _drop_after(doc, anchor_el, slot, [], wording=wording,
+                               complete=complete, at_marker=at_marker)
+        inserted = attach_media_at_anchor(doc, anchor[0], files)
+        logger.info('material anchor key=%s rule=%s inserted=%s', slot.key, anchor[1], inserted)
+        if inserted:
+            drop_trailing_orphan_images(doc, {slot.key})
+        return bool(inserted)
     assert_insertable(doc, anchor_el)
     import hashlib
     from api.services.tenders.material_layout import constrain_blocks

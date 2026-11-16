@@ -11,13 +11,15 @@ from pathlib import Path
 
 from docx import Document
 from docx.enum.section import WD_SECTION
+from docx.enum.style import WD_STYLE_TYPE
 from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT, WD_TABLE_ALIGNMENT
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from docx.shared import Cm, Pt, RGBColor
+from docx.shared import Cm, Pt, RGBColor, Twips
 
 from api.services.tenders.business_draft_policy import business_draft_body
+from api.services.tenders.title_cleanup import strip_title_tail
 
 from api.services.tenders.document import (
     _add_bottom_sign_spacer,
@@ -99,8 +101,9 @@ from api.services.tenders.outline import (
 from api.services.tenders.placeholders import (
     collect_slots,
     draw_placeholder_box,
-    id_slot,
-    inline_id_scans,
+    attach_media_at_anchor,
+    drop_trailing_orphan_images,
+    find_material_anchor,
     _insert_slot_media,
 )
 from api.services.tenders.schema import BidBrief, DocumentFormat, OutlineItem, PlaceholderItem
@@ -648,6 +651,37 @@ def assemble_bid_docx(
         out.extend(f"目录待确认（缺少来源标题）：{item.id}"
                    for item in brief.outlineItems
                    if not item.skipped and item.tocEligible is not False and not _toc_source_title(item))
+        from api.services.tenders.heading_style import (
+            resolve_heading_points, apply_heading_styles, normalize_heading_paragraphs,
+        )
+        points = resolve_heading_points(document)
+        apply_heading_styles(document, points)
+        heading_changes = normalize_heading_paragraphs(document, points)
+        violations = []
+        for index, paragraph in enumerate(document.paragraphs):
+            if paragraph.style.name not in {"Heading 1", "Heading 2"}:
+                continue
+            size = None
+            for run in paragraph.runs:
+                if run.font.size is not None:
+                    size = run.font.size.pt
+                    break
+            if size is None:
+                style = paragraph.style
+                while style is not None and style.font.size is None:
+                    style = style.base_style
+                size = style.font.size.pt if (style is not None and style.font.size is not None) else None
+            if size is not None and size > 22:
+                violations.append((index, paragraph.text[:20], size))
+        if violations:
+            out.append(
+                f"标题字号未归一化：{len(violations)} 处（示例 {violations[0][1]}={violations[0][2]} pt）"
+            )
+            logger.warning("heading size violation: %s", violations[:5])
+        logger.info("heading style normalize: %s", points)
+        object.__setattr__(named, '_heading_style_report', {
+            **points, 'changes': len(heading_changes), 'violations': len(violations),
+        })
         document.save(path)
         return path, out
 
@@ -1046,14 +1080,14 @@ def assemble_bid_docx(
                     if _chapter_role(item) in {"offer", "commitment"}:
                         _write_body(doc, business_draft_body(item), fmt)
                 if kind == "auth":
-                    _inline_copied_id(
+                    warnings.extend(_inline_copied_id(
                         doc,
                         start=start,
                         key="id_agent",
                         media=media,
                         inlined=inlined_ids,
                         has_agent=bool(brief.authEnabled),
-                    )
+                    ))
                 copied += 1
                 continue
             if kind in MODULE_KINDS and not has_body and not verbatim and kind not in COPY_KINDS:
@@ -1666,7 +1700,7 @@ def _display_title(item: OutlineItem) -> str:
     title = (item.title or "").strip()
     raw = (getattr(item, "rawTitle", "") or "").strip()
     if not title:
-        return raw
+        return strip_title_tail(raw)
     prefix = re.compile(
         r"^\s*(?:第[一二三四五六七八九十百零〇0-9]+[章节部分]|"
         r"[一二三四五六七八九十百零〇0-9]+[、.．]|"
@@ -1676,8 +1710,8 @@ def _display_title(item: OutlineItem) -> str:
     # ``title`` is the normalized display value.  A raw prefix is only a
     # fallback for templates whose visible title lives exclusively in rawTitle.
     if raw and len(raw) <= 60 and not prefix.match(title) and prefix.match(raw):
-        return raw
-    return title
+        return strip_title_tail(raw)
+    return strip_title_tail(title)
 
 
 def _renumber_format_elements(doc: Document, elements: list, items: list[OutlineItem]) -> int:
@@ -1736,6 +1770,28 @@ def _write_toc(
     from dataclasses import replace
     from api.services.tenders.style_roles import build_style_profile, classify_paragraph
 
+    def write_toc_line(para, index, title, bookmark, cache, *, label, with_pages,
+                       level, preserve_title=False):
+        level = max(1, min(3, int(level or 1)))
+        style_name = f"TOC {level}"
+        _write_toc_line(
+            para,
+            index,
+            title,
+            bookmark,
+            cache,
+            label=label,
+            with_pages=with_pages,
+            level=level,
+            preserve_title=preserve_title,
+        )
+        try:
+            toc_style = doc.styles[style_name]
+        except KeyError:
+            toc_style = doc.styles.add_style(style_name, WD_STYLE_TYPE.PARAGRAPH)
+        para.style = toc_style
+        para.paragraph_format.left_indent = Twips(420 * (level - 1))
+
     # The directory is projected from the runtime skeleton only.  Probe the
     # learned heading role without retaining the temporary paragraph, so body
     # prose can never become a directory entry by accident.
@@ -1751,7 +1807,12 @@ def _write_toc(
             title = _toc_source_title(item)
             if not title:
                 continue
-            style = "Heading 1" if int(getattr(item, "level", 1) or 1) <= 1 else "Heading 2"
+            item_level = max(1, int(getattr(item, "level", 1) or 1))
+            style = (
+                "Heading 1" if item_level <= 1
+                else "Heading 2" if item_level == 2
+                else "Heading 9"
+            )
             probe = doc.add_paragraph(title, style=style)
             role = classify_paragraph(probe, probe_profile)
             probe._element.getparent().remove(probe._element)
@@ -1770,9 +1831,11 @@ def _write_toc(
     _run(head, "目录", size=fmt.tocTitleSizePt, bold=True, font=fmt.fontName)
     if brief.requirementsDriven:
         for i, (item, bookmark) in enumerate(zip(items, bookmarks, strict=True)):
-            _write_toc_line(doc.add_paragraph(), i, _display_title(item), bookmark,
-                            toc_page_cache(i, fmt), label='', level=item.level, with_pages=True,
-                            preserve_title=technical_projection)
+            write_toc_line(
+                doc.add_paragraph(), i, _display_title(item), bookmark,
+                toc_page_cache(i, fmt), label='', level=item.level, with_pages=True,
+                preserve_title=technical_projection,
+            )
         return
     verbatim = (brief.layoutMode or "").strip() == "outline"
     if verbatim:
@@ -1791,7 +1854,7 @@ def _write_toc(
             shows = toc_numbered_lines(pairs)
         for i, item in enumerate(items):
             para = doc.add_paragraph()
-            _write_toc_line(
+            write_toc_line(
                 para,
                 i,
                 shows[i],
@@ -1807,7 +1870,7 @@ def _write_toc(
     rows = flatten_toc_tree(tree, fmt.tocNumbering)
     for i, (label, title, level, bm) in enumerate(rows):
         para = doc.add_paragraph()
-        _write_toc_line(
+        write_toc_line(
             para,
             i,
             bid_item_title(title),
@@ -1828,29 +1891,25 @@ def _inline_copied_id(
     media: dict | None,
     inlined: set[str],
     has_agent: bool,
-) -> None:
+) -> list[str]:
     if key == "id_agent" and not has_agent:
-        return
-    before = None
-    for p in doc.paragraphs[start:]:
-        t = "".join((p.text or "").split())
-        if t.startswith("投标人") and (
-            "盖单位公章" in t or "（章）" in t or "(章)" in t or "签字" in t
-        ):
-            before = p
-            break
-    n = inline_id_scans(
-        doc,
-        (media or {}).get(key) if media else None,
-        empty_slot=id_slot(key),
-        before=before,
-    )
+        return []
+    anchor = find_material_anchor(doc, key)
+    if anchor is None:
+        return [f"资料「{key}」未找到落位锚点，已保留占位框，请人工粘贴"]
+    n = attach_media_at_anchor(doc, anchor[0], list((media or {}).get(key) or []), key=key)
+    logger.info('material anchor key=%s rule=%s inserted=%s', key, anchor[1], n)
+    if not n:
+        return [f"资料「{key}」未能插入，已保留占位框，请人工粘贴"]
     inlined.add(key)
+    drop_trailing_orphan_images(doc, {key})
+    return []
 
 
 def _write_heading(doc: Document, title: str, fmt: DocumentFormat, bookmark: str | None = None):
     para = doc.add_paragraph()
     normalized_title = (bid_item_title(title) or "").strip() or "附件"
+    normalized_title = strip_title_tail(normalized_title)
     child = bool(re.match(
         r"^\s*(?:[（(][一二三四五六七八九十百零〇0-9]+[）)]|\d+(?:[.．]\d+)+)",
         normalized_title,
