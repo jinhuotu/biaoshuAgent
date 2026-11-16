@@ -226,21 +226,23 @@ def _status_at_deadline(ctx: ComposeContext, certificate: dict) -> str:
 
 def build_technical_supplements(ctx: ComposeContext, section: Section) -> None:
     supplements = _applicable_supplements(ctx, "technical")
-    section.blocks.append(paragraph("按照招标文件第一章投标邀请书关于“投标人须在技术投标文件中提供补充支持证明材料”的要求，我方逐项提交如下："))
+    section.blocks.append(paragraph(ctx.pick(
+        "按照招标文件第一章投标邀请书关于“投标人须在技术投标文件中提供补充支持证明材料”的要求，我方逐项提交如下：",
+        "根据招标文件第一章投标邀请书“投标人须在技术投标文件中提供补充支持证明材料”的规定，我方现逐项提交：",
+        "依据招标文件第一章投标邀请书“投标人须在技术投标文件中提供补充支持证明材料”的要求，现将各项材料提交如下：",
+    )))
     for index, item in enumerate(supplements, start=1):
         if "质量控制" in item["item"]:
             criteria = _find_criteria(ctx, "technical", "产品制造质量控制")
             child = _child(section, f"s{index}", item["item"], criteria=[c["criterion_id"] for c in criteria])
-            child.blocks.append(paragraph(f"招标文件要求：{item['note']}"))
             _quality_control_evidence(ctx, child)
         elif "绿色" in item["item"]:
             criteria = _find_criteria(ctx, "technical", "绿色低碳", "碳足迹")
             child = _child(section, f"s{index}", item["item"], criteria=[c["criterion_id"] for c in criteria])
-            child.blocks.append(paragraph(f"招标文件要求：{item['note']}"))
             _green_manufacturing(ctx, child)
         else:
             child = _child(section, f"s{index}", item["item"])
-            child.blocks += [paragraph(f"招标文件要求：{item['note']}"), paragraph("我方满足该项要求，证明材料如下。"), placeholder(f"（此处粘贴：{item['item']}相关证明材料）")]
+            child.blocks += [paragraph("我方满足该项要求，证明材料如下。"), placeholder(f"（此处粘贴：{item['item']}相关证明材料）")]
     if not supplements:
         section.blocks.append(paragraph("招标文件未对所投分标提出需补充的技术支撑证明材料，本项无补充内容。"))
 
@@ -251,7 +253,11 @@ def _quality_control_evidence(ctx: ComposeContext, section: Section) -> None:
         section,
         "incoming",
         "原材料组部件进厂检验检测措施",
-        paragraph(f"{ctx.company_name}制定了《原材料及组部件进厂检验规程》《供应商筛选与评价管理制度》《物料标识与存放管理规定》《仓库出入库管理制度》，对导体、绝缘料、半导电屏蔽料、铜带、钢带、护套料等关键原材料实行“批批检验、批批建档”。"),
+        paragraph(ctx.pick(
+            f"{ctx.company_name}制定了《原材料及组部件进厂检验规程》《供应商筛选与评价管理制度》《物料标识与存放管理规定》《仓库出入库管理制度》，对导体、绝缘料、半导电屏蔽料、铜带、钢带、护套料等关键原材料实行“批批检验、批批建档”。",
+            f"{ctx.company_name}依据《原材料及组部件进厂检验规程》《供应商筛选与评价管理制度》《物料标识与存放管理规定》《仓库出入库管理制度》管理原材料，导体、绝缘料、半导电屏蔽料、铜带、钢带、护套料等关键原材料一律“批批检验、批批建档”。",
+            f"围绕导体、绝缘料、半导电屏蔽料、铜带、钢带、护套料等关键原材料，{ctx.company_name}执行《原材料及组部件进厂检验规程》《供应商筛选与评价管理制度》《物料标识与存放管理规定》《仓库出入库管理制度》，做到“批批检验、批批建档”。",
+        )),
         table(
             ["原材料", "检验项目", "检验方式", "判定依据"],
             [
@@ -264,7 +270,11 @@ def _quality_control_evidence(ctx: ComposeContext, section: Section) -> None:
             ],
             widths=[3.0, 7.2, 3.4, 2.8],
         ),
-        paragraph("检验合格的原材料方可办理入库并粘贴合格标识；不合格原材料隔离存放并按《不合格品控制程序》退货或让步处理。检验记录与供应商检测合格证明一并归档，实现原材料组部件全过程可追溯。"),
+        paragraph(ctx.pick(
+            "检验合格的原材料方可办理入库并粘贴合格标识；不合格原材料隔离存放并按《不合格品控制程序》退货或让步处理。检验记录与供应商检测合格证明一并归档，实现原材料组部件全过程可追溯。",
+            "原材料经检验合格并粘贴合格标识后才能入库；不合格的隔离存放，按《不合格品控制程序》作退货或让步处理。检验记录连同供应商检测合格证明统一归档，原材料组部件全过程可追溯。",
+            "只有检验合格的原材料才允许入库并贴合格标识，不合格品一律隔离，依《不合格品控制程序》退货或让步接收。所有检验记录和供应商检测合格证明归档保存，保证原材料组部件全过程可追溯。",
+        )),
         placeholder("（此处粘贴：进厂检验规程、检验记录及供应商检测合格证明样例）", height=4.5),
     )
     _child(
@@ -272,14 +282,26 @@ def _quality_control_evidence(ctx: ComposeContext, section: Section) -> None:
         "process",
         "生产工艺与质量管控体系",
         paragraph("公司通过质量管理体系认证，工艺文件覆盖" + "、".join(p[0] for p in _CABLE_PROCESSES) + "等全部主要工序，各工序严格按工艺文件和作业指导书执行，设置工序质量控制点，实行“自检、互检、专检”三检制，上道工序不合格不得流入下道工序。"),
-        paragraph("生产过程中每盘半成品均附流转卡，记录操作者、设备、工艺参数、检验结果及原材料批号，成品可逆向追溯至原材料批次与生产班组。"),
+        paragraph(ctx.pick(
+            "生产过程中每盘半成品均附流转卡，记录操作者、设备、工艺参数、检验结果及原材料批号，成品可逆向追溯至原材料批次与生产班组。",
+            "每盘半成品随附流转卡，载明操作者、设备、工艺参数、检验结果和原材料批号，可由成品逆向追溯到原材料批次及生产班组。",
+            "半成品逐盘配流转卡，操作者、设备、工艺参数、检验结果、原材料批号等信息完整记录，成品能够逆向追溯至原材料批次和生产班组。",
+        )),
     )
     _child(
         section,
         "environment",
         "生产制造环境与试组装环境",
-        paragraph("绝缘线芯三层共挤交联工序设置洁净上料间，绝缘料采用封闭式自动上料系统，净化等级满足中压电缆生产要求；车间实行 6S 管理，温湿度、粉尘受控。"),
-        paragraph("公司设有独立的试制 / 试组装区域和成品检测中心，新产品及工艺变更产品先行试制并经型式试验验证后方可批量生产。"),
+        paragraph(ctx.pick(
+            "绝缘线芯三层共挤交联工序设置洁净上料间，绝缘料采用封闭式自动上料系统，净化等级满足中压电缆生产要求；车间实行 6S 管理，温湿度、粉尘受控。",
+            "三层共挤交联工序配有洁净上料间，绝缘料经封闭式自动上料系统输送，净化等级达到中压电缆生产要求；生产车间推行 6S 管理，温湿度和粉尘均处于受控状态。",
+            "在绝缘线芯三层共挤交联工序，公司设洁净上料间并采用封闭式自动上料系统输送绝缘料，净化等级符合中压电缆生产要求；车间按 6S 管理，对温湿度、粉尘实施控制。",
+        )),
+        paragraph(ctx.pick(
+            "公司设有独立的试制 / 试组装区域和成品检测中心，新产品及工艺变更产品先行试制并经型式试验验证后方可批量生产。",
+            "公司建有独立的试制 / 试组装区域与成品检测中心，新产品和工艺变更产品须先试制、通过型式试验验证后再转入批量生产。",
+            "试制 / 试组装区域和成品检测中心独立设置，凡新产品或工艺发生变更的产品，均先行试制并通过型式试验验证，方可批量投产。",
+        )),
         placeholder("（此处粘贴：生产车间、洁净上料间、检测中心现场照片）", height=5),
     )
     _child(
@@ -300,8 +322,17 @@ def _green_manufacturing(ctx: ComposeContext, section: Section) -> None:
         paragraph(f"我公司已取得国家工信部认定的{'、'.join(c['name'] for c in held)}（共 {len(held)} 项），证书附后。" if held else "我公司已建立绿色生产和绿色回收制度（如已取得工信部绿色工厂、绿色供应链管理企业认定，请在企业资料中登记）。")
     )
     section.blocks += [
-        paragraph("绿色低碳生产：（1）采用节能型拉丝、交联、挤出设备及变频控制技术，冷却水全部循环利用；（2）推行清洁生产审核，单位产品综合能耗逐年下降；（3）厂区建设分布式光伏、余热回收等节能项目；（4）优先选用无卤低烟、可回收的环保型原材料与包装材料。"),
-        paragraph("绿色回收：制定《绿色回收管理制度》，废铜、废铝、废塑料、废电缆盘等实行分类收集、定点存放、台账管理，交由有资质的单位回收再生利用；对电缆盘具推行循环使用与回收服务。" if ctx.profile["declarations"]["greenRecycling"] else f"绿色回收制度：{ctx.need('绿色回收制度文件')}"),
+        paragraph("绿色低碳生产：" + ctx.enumerate_clauses([
+            "采用节能型拉丝、交联、挤出设备及变频控制技术，冷却水全部循环利用",
+            "推行清洁生产审核，单位产品综合能耗逐年下降",
+            "厂区建设分布式光伏、余热回收等节能项目",
+            "优先选用无卤低烟、可回收的环保型原材料与包装材料",
+        ])),
+        paragraph(ctx.pick(
+            "绿色回收：制定《绿色回收管理制度》，废铜、废铝、废塑料、废电缆盘等实行分类收集、定点存放、台账管理，交由有资质的单位回收再生利用；对电缆盘具推行循环使用与回收服务。",
+            "绿色回收：公司执行《绿色回收管理制度》，对废铜、废铝、废塑料、废电缆盘等分类收集、定点存放并建立台账，统一交有资质的单位回收再生利用；电缆盘具实行循环使用并提供回收服务。",
+            "绿色回收：按《绿色回收管理制度》，废铜、废铝、废塑料、废电缆盘等废旧物资分类收集、定点存放、台账管理后，委托有资质的单位回收再生；电缆盘具循环使用，并向用户提供回收服务。",
+        ) if ctx.profile["declarations"]["greenRecycling"] else f"绿色回收制度：{ctx.need('绿色回收制度文件')}"),
         paragraph(f"产品碳足迹：我公司已取得{footprint[0]['name']}，证书附后。" if footprint else "产品碳足迹：我公司正按 ISO 14067 开展投标产品碳足迹核算（如已取得产品碳足迹证书，请在企业资料中登记并附证书）。"),
         placeholder("（此处粘贴：绿色工厂 / 绿色供应链认定文件、绿色低碳生产及绿色回收制度文件）", height=5),
     ]
@@ -309,7 +340,11 @@ def _green_manufacturing(ctx: ComposeContext, section: Section) -> None:
 
 def build_other_technical_documents(ctx: ComposeContext, section: Section) -> None:
     """工艺管理体系、生产 / 试验设备、人力资源、创新能力。"""
-    section.blocks.append(paragraph("我方按招标文件规定及技术评分标准，提交工艺管理体系、生产试验设备、人力资源与创新能力说明如下。"))
+    section.blocks.append(paragraph(ctx.pick(
+        "我方按招标文件规定及技术评分标准，提交工艺管理体系、生产试验设备、人力资源与创新能力说明如下。",
+        "按照招标文件规定和技术评分标准，我方就工艺管理体系、生产试验设备、人力资源及创新能力分别说明如下。",
+        "现依据招标文件规定及技术评分标准，对我方工艺管理体系、生产与试验设备、人力资源和创新能力作如下说明。",
+    )))
     process_criteria = _find_criteria(ctx, "technical", "设备工艺")
     process = _child(section, "process", "工艺文件与原材料 / 组部件管理文件", criteria=[c["criterion_id"] for c in process_criteria])
     complete = ctx.profile["declarations"]["processDocsComplete"]
@@ -324,7 +359,11 @@ def build_other_technical_documents(ctx: ComposeContext, section: Section) -> No
     ctx.within_section(equipment.key)
     owned = ctx.profile["equipment"]
     equipment.blocks += [
-        paragraph("我公司拥有与投标产品相适应的成套生产设备，主要生产设备配置如下："),
+        paragraph(ctx.pick(
+            "我公司拥有与投标产品相适应的成套生产设备，主要生产设备配置如下：",
+            "我公司生产设备成套配置，与投标产品的生产需要相适应，主要设备如下：",
+            "为满足投标产品的生产需要，我公司配置了成套生产设备，主要设备见下表：",
+        )),
         table(
             ["序号", "设备类别", "数量", "单位", "招标文件评分门槛"],
             [[str(i), e.get("name", ""), ctx.value(e.get("count"), f"{e.get('name', '设备')}数量"), e.get("unit", "套"), _equipment_threshold(equipment_criteria, e.get("name", ""))] for i, e in enumerate(owned, start=1)]
@@ -365,7 +404,11 @@ def build_other_technical_documents(ctx: ComposeContext, section: Section) -> No
     ctx.within_section(innovation.key)
     standards, patents, awards = ctx.profile["standards"], ctx.profile["patents"], ctx.profile["awards"]
     innovation.blocks += [
-        paragraph("我公司坚持自主创新，积极参与标准制修订并持续取得专利与科技成果。"),
+        paragraph(ctx.pick(
+            "我公司坚持自主创新，积极参与标准制修订并持续取得专利与科技成果。",
+            "我公司长期坚持自主创新，参与标准制修订，并不断取得专利和科技成果。",
+            "自主创新是我公司一贯的发展方针，公司积极参与标准制修订，专利与科技成果持续产出。",
+        )),
         table(["序号", "标准名称 / 编号", "标准级别"], [[str(i), s.get("name", ""), s.get("level", "")] for i, s in enumerate(standards, start=1)] or [["1", ctx.need("参与制定的与投标产品相关的标准"), ""]], caption="参与制定的标准"),
         table(["序号", "专利名称", "专利号", "专利类型"], [[str(i), p.get("name", ""), p.get("number", ""), p.get("kind", "")] for i, p in enumerate(patents, start=1)] or [["1", ctx.need("与所投产品相关的发明专利"), "", ""]], caption="与所投产品相关的专利"),
         table(["序号", "科技奖励名称", "级别", "年份"], [[str(i), a.get("name", ""), a.get("level", ""), str(a.get("year", ""))] for i, a in enumerate(awards, start=1)] or [["1", ctx.need("与投标产品相关的科技奖励"), "", ""]], caption="获得的科技奖励"),
@@ -386,12 +429,20 @@ def _equipment_threshold(criteria: list[dict], name: str) -> str:
 
 def build_technical_service(ctx: ComposeContext, section: Section) -> None:
     service = ctx.profile["service"]
-    section.blocks.append(paragraph(f"{ctx.company_name}将为本项目提供覆盖供货前、供货中、供货后全过程的技术服务，服务内容包括技术交底、监造配合、到货验收、安装指导、培训及运行技术支持。"))
+    section.blocks.append(paragraph(ctx.pick(
+        f"{ctx.company_name}将为本项目提供覆盖供货前、供货中、供货后全过程的技术服务，服务内容包括技术交底、监造配合、到货验收、安装指导、培训及运行技术支持。",
+        f"针对本项目，{ctx.company_name}提供贯穿供货前、供货中、供货后的全过程技术服务，包括技术交底、监造配合、到货验收、安装指导、培训和运行技术支持。",
+        f"{ctx.company_name}对本项目的技术服务覆盖供货前、供货中和供货后各阶段，具体包括技术交底、监造配合、到货验收、安装指导、培训以及运行技术支持。",
+    )))
     _child(
         section,
         "team",
         "技术服务组织机构",
-        paragraph("我公司成立本项目专项服务组，由分管副总经理任组长，下设技术支持、生产协调、质量检验、物流交付和现场服务五个专业小组，实行项目经理负责制，对项目单位实行“一个窗口对接、全过程闭环管理”。"),
+        paragraph(ctx.pick(
+            "我公司成立本项目专项服务组，由分管副总经理任组长，下设技术支持、生产协调、质量检验、物流交付和现场服务五个专业小组，实行项目经理负责制，对项目单位实行“一个窗口对接、全过程闭环管理”。",
+            "我公司为本项目组建专项服务组，分管副总经理担任组长，设技术支持、生产协调、质量检验、物流交付、现场服务五个专业小组，按项目经理负责制运作，对项目单位做到“一个窗口对接、全过程闭环管理”。",
+            "本项目设专项服务组，组长由分管副总经理担任，组内分技术支持、生产协调、质量检验、物流交付和现场服务五个专业小组；服务组实行项目经理负责制，以“一个窗口对接、全过程闭环管理”的方式服务项目单位。",
+        )),
         table(
             ["岗位", "职责", "响应要求"],
             [
@@ -416,7 +467,11 @@ def build_technical_service(ctx: ComposeContext, section: Section) -> None:
         section,
         "delivery",
         "到货验收服务",
-        paragraph("货物运抵指定交货地点后，我公司派专人到场配合清点卸货、开箱验收，核对装箱单、盘号、长度和实物 ID 信息，配合完成外观检查与到货抽检取样；验收中发现问题的，现场确认后立即启动处理流程。"),
+        paragraph(ctx.pick(
+            "货物运抵指定交货地点后，我公司派专人到场配合清点卸货、开箱验收，核对装箱单、盘号、长度和实物 ID 信息，配合完成外观检查与到货抽检取样；验收中发现问题的，现场确认后立即启动处理流程。",
+            "货物到达指定交货地点后，我公司安排专人到场，配合清点卸货和开箱验收，逐项核对装箱单、盘号、长度及实物 ID 信息，并配合外观检查和到货抽检取样；如验收发现问题，经现场确认后立即启动处理流程。",
+            "到货后，我公司专人赴指定交货地点配合清点卸货、开箱验收，对装箱单、盘号、长度、实物 ID 信息逐一核对，协助完成外观检查及到货抽检取样；验收发现的问题现场确认，并立即启动处理流程。",
+        )),
     )
     _child(
         section,
@@ -455,8 +510,16 @@ def build_after_sales(ctx: ComposeContext, section: Section) -> None:
     service = ctx.profile["service"]
     criteria = _find_criteria(ctx, "business", "售后服务")
     section.criteria += [c["criterion_id"] for c in criteria]
-    section.blocks.append(paragraph(f"{ctx.company_name}郑重承诺对本项目所供产品提供全面、及时、专业的售后服务，具体保障措施及承诺如下。"))
-    _child(section, "warranty", "质量保证期承诺", paragraph("质量保证期按合同约定执行。质保期内因产品设计、材料、制造工艺等质量原因造成的损坏或不能正常使用，我公司负责免费修复或更换，并承担由此产生的直接费用；质保期满后继续提供终身有偿技术服务。"))
+    section.blocks.append(paragraph(ctx.pick(
+        f"{ctx.company_name}郑重承诺对本项目所供产品提供全面、及时、专业的售后服务，具体保障措施及承诺如下。",
+        f"对本项目所供产品，{ctx.company_name}郑重承诺提供全面、及时、专业的售后服务，保障措施与承诺内容如下。",
+        f"{ctx.company_name}郑重承诺：本项目所供产品的售后服务做到全面、及时、专业，各项保障措施及承诺分述如下。",
+    )))
+    _child(section, "warranty", "质量保证期承诺", paragraph(ctx.pick(
+        "质量保证期按合同约定执行。质保期内因产品设计、材料、制造工艺等质量原因造成的损坏或不能正常使用，我公司负责免费修复或更换，并承担由此产生的直接费用；质保期满后继续提供终身有偿技术服务。",
+        "质量保证期以合同约定为准。质保期内，凡因产品设计、材料或制造工艺等质量原因导致损坏或无法正常使用的，由我公司免费修复或更换，由此产生的直接费用由我公司承担；质保期届满后，我公司继续提供终身有偿技术服务。",
+        "质量保证期执行合同约定。在质保期内，产品因设计、材料、制造工艺等质量原因发生损坏或不能正常使用，我公司免费修复或更换并承担相应直接费用；质保期满后仍提供终身有偿技术服务。",
+    )))
     _child(
         section,
         "network",
@@ -478,13 +541,26 @@ def build_after_sales(ctx: ComposeContext, section: Section) -> None:
             ],
         ),
     )
-    _child(section, "emergency", "应急保供承诺", paragraph("建立应急保供预案和 7×24 小时值班制度，对电网抢险、突发故障、重大保电等紧急需求优先排产、专车直发，全力保障电网建设与安全运行。"))
-    _child(section, "trace", "质量追溯", paragraph("所供产品全部按国家电网公司实物 ID 管理要求赋码，随物资提供并安装二维码标签和 RFID 电子标签，实现“一物一码”全寿命周期质量追溯；产品质量档案保存期限不少于产品设计寿命。"))
+    _child(section, "emergency", "应急保供承诺", paragraph(ctx.pick(
+        "建立应急保供预案和 7×24 小时值班制度，对电网抢险、突发故障、重大保电等紧急需求优先排产、专车直发，全力保障电网建设与安全运行。",
+        "我公司备有应急保供预案并实行 7×24 小时值班，电网抢险、突发故障、重大保电等紧急需求一律优先排产、专车直发，全力保障电网建设与安全运行。",
+        "针对电网抢险、突发故障、重大保电等紧急需求，我公司按应急保供预案和 7×24 小时值班制度组织优先排产与专车直发，全力保障电网建设与安全运行。",
+    )))
+    _child(section, "trace", "质量追溯", paragraph(ctx.pick(
+            "所供产品全部按国家电网公司实物 ID 管理要求赋码，随物资提供并安装二维码标签和 RFID 电子标签，实现“一物一码”全寿命周期质量追溯；产品质量档案保存期限不少于产品设计寿命。",
+            "我公司对所供产品全部按国家电网公司实物 ID 管理要求赋码，二维码标签和 RFID 电子标签随物资提供并安装到位，以“一物一码”实现全寿命周期质量追溯；产品质量档案的保存期限不短于产品设计寿命。",
+            "按国家电网公司实物 ID 管理要求，所供产品逐一赋码，并随物资提供、安装二维码标签和 RFID 电子标签，做到“一物一码”、全寿命周期质量可追溯；产品质量档案至少保存至产品设计寿命期满。",
+        )))
     _child(
         section,
         "commitment",
         "履约承诺",
-        paragraph("（1）严格履行合同约定的交货期、交货数量和交货地点，接受买方监督考核；（2）不转包、不违规分包、不贴牌代工；（3）发生质量问题时积极配合调查处理并承担相应责任；（4）接受买方按抽检规范开展的各类抽检，抽检不合格的按合同约定承担违约责任。"),
+        paragraph(ctx.enumerate_clauses([
+            "严格履行合同约定的交货期、交货数量和交货地点，接受买方监督考核",
+            "不转包、不违规分包、不贴牌代工",
+            "发生质量问题时积极配合调查处理并承担相应责任",
+            "接受买方按抽检规范开展的各类抽检，抽检不合格的按合同约定承担违约责任",
+        ])),
         ctx.signature_block(),
     )
 
@@ -493,7 +569,11 @@ def build_quality_assurance(ctx: ComposeContext, section: Section) -> None:
     systems = _has_certificate(ctx, "quality_system", "environment_system", "safety_system")
     criteria = _find_criteria(ctx, "technical", "履约风险")
     section.criteria += [c["criterion_id"] for c in criteria]
-    section.blocks.append(paragraph("为确保本项目供货产品质量持续满足招标文件及技术规范书要求，我公司制定如下质量保证措施方案。"))
+    section.blocks.append(paragraph(ctx.pick(
+        "为确保本项目供货产品质量持续满足招标文件及技术规范书要求，我公司制定如下质量保证措施方案。",
+        "为确保本项目所供产品的质量始终符合招标文件和技术规范书要求，我公司编制质量保证措施方案如下。",
+        "我公司针对本项目制定了下述质量保证措施方案，以确保供货产品质量持续满足招标文件及技术规范书的要求。",
+    )))
     _child(
         section,
         "system",
@@ -518,14 +598,22 @@ def build_quality_assurance(ctx: ComposeContext, section: Section) -> None:
             widths=[4.0, 12.4],
         ),
     )
-    _child(section, "material", "原材料质量控制", paragraph("建立合格供方名录与动态评价机制，关键原材料只从合格供方采购并签订质量保证协议；所有原材料进厂后按检验规程“批批检验、批批建档”，检验合格方可入库投产；原材料按批次标识、分区存放、先进先出，保证全过程可追溯。"))
+    _child(section, "material", "原材料质量控制", paragraph(ctx.pick(
+        "建立合格供方名录与动态评价机制，关键原材料只从合格供方采购并签订质量保证协议；所有原材料进厂后按检验规程“批批检验、批批建档”，检验合格方可入库投产；原材料按批次标识、分区存放、先进先出，保证全过程可追溯。",
+        "公司实行合格供方名录管理和动态评价，关键原材料仅向合格供方采购并签订质量保证协议；原材料进厂一律按检验规程“批批检验、批批建档”，合格后才能入库投产；库内原材料按批次标识、分区存放、先进先出，全过程可追溯。",
+        "关键原材料只在合格供方名录内采购，并与供方签订质量保证协议，供方实行动态评价；进厂原材料全部按检验规程“批批检验、批批建档”，检验合格方准入库投产；存放环节做到批次标识清晰、分区存放、先进先出，保证全过程可追溯。",
+    )))
     _child(
         section,
         "process",
         "生产过程质量控制",
         paragraph("各工序严格按工艺文件与作业指导书执行，设置下列工序质量控制点，上道工序不合格不得流入下道工序："),
         table(["控制环节", "控制对象", "控制 / 检验项目", "检验频次"], [list(row) for row in _QUALITY_CHECKPOINTS], widths=[2.8, 3.6, 6.8, 3.2]),
-        paragraph("关键工序实行首件检验确认制度，在线测偏仪、火花试验机等在线监测装置与设备联锁，工艺参数由系统自动采集、超限报警并留存记录。"),
+        paragraph(ctx.pick(
+            "关键工序实行首件检验确认制度，在线测偏仪、火花试验机等在线监测装置与设备联锁，工艺参数由系统自动采集、超限报警并留存记录。",
+            "关键工序执行首件检验确认制度；在线测偏仪、火花试验机等在线监测装置与生产设备联锁，系统自动采集工艺参数，超限即报警并保存记录。",
+            "对关键工序，公司实行首件检验确认；在线测偏仪、火花试验机等监测装置与设备联锁运行，工艺参数自动采集、超限报警，记录全部留存。",
+        )),
     )
     _child(
         section,
@@ -535,9 +623,21 @@ def build_quality_assurance(ctx: ComposeContext, section: Section) -> None:
         table(["试验项目", "试验类别", "试验方法标准", "频次", "合格判据"], [list(row) for row in _ROUTINE_TESTS], widths=[3.4, 2.2, 3.0, 2.6, 5.2]),
         paragraph("投标产品型式试验报告由国家授权的专业检测机构出具；供货前按承诺函向买方提交与所供产品型号一致的有效型式试验报告。"),
     )
-    _child(section, "package", "包装、运输与交付质量控制", paragraph("电缆采用符合 JB/T 8137 要求的电缆盘交货，电缆两端可靠密封防潮，盘面清晰标注型号规格、长度、毛重、制造日期、旋转方向及实物 ID 标识；装卸采用吊装方式，严禁平放和抛滚；运输途中采取防雨、防碰撞、防滚动措施；随货提供出厂检验报告、合格证、装箱单等技术文件。"))
-    _child(section, "nonconformity", "不合格品控制与质量问题处理", paragraph("不合格品严格执行“标识、隔离、评审、处置”程序，杜绝不合格品出厂。供货后如发生质量问题，我公司在接到通知后立即响应，无偿修复或更换不合格产品并承担相应损失，同时开展原因分析，制定纠正和预防措施，向买方提交书面整改报告。"))
-    _child(section, "improvement", "持续改进", paragraph("公司定期开展内部审核、管理评审和质量分析会，运用 QC 小组、统计过程控制（SPC）等方法持续改进产品质量与过程能力；主动收集用户意见和运行反馈，纳入产品与工艺改进计划。"))
+    _child(section, "package", "包装、运输与交付质量控制", paragraph(ctx.pick(
+            "电缆采用符合 JB/T 8137 要求的电缆盘交货，电缆两端可靠密封防潮，盘面清晰标注型号规格、长度、毛重、制造日期、旋转方向及实物 ID 标识；装卸采用吊装方式，严禁平放和抛滚；运输途中采取防雨、防碰撞、防滚动措施；随货提供出厂检验报告、合格证、装箱单等技术文件。",
+            "电缆以符合 JB/T 8137 要求的电缆盘交货，两端可靠密封防潮，盘面清楚标明型号规格、长度、毛重、制造日期、旋转方向和实物 ID 标识；装卸一律吊装，禁止平放、抛滚；运输过程采取防雨、防碰撞、防滚动措施；出厂检验报告、合格证、装箱单等技术文件随货提供。",
+            "交货用电缆盘符合 JB/T 8137 要求，电缆两端密封防潮可靠，型号规格、长度、毛重、制造日期、旋转方向及实物 ID 标识在盘面清晰标注；装卸时采用吊装，严禁平放和抛滚；在途采取防雨、防碰撞、防滚动措施；出厂检验报告、合格证、装箱单等技术文件随货发出。",
+        )))
+    _child(section, "nonconformity", "不合格品控制与质量问题处理", paragraph(ctx.pick(
+        "不合格品严格执行“标识、隔离、评审、处置”程序，杜绝不合格品出厂。供货后如发生质量问题，我公司在接到通知后立即响应，无偿修复或更换不合格产品并承担相应损失，同时开展原因分析，制定纠正和预防措施，向买方提交书面整改报告。",
+        "对不合格品，公司严格按“标识、隔离、评审、处置”程序处理，确保不合格品不出厂。供货后一旦出现质量问题，我公司接到通知即立即响应，无偿修复或更换不合格产品、承担相应损失，并分析原因、制定纠正和预防措施，以书面整改报告提交买方。",
+        "公司对不合格品实行“标识、隔离、评审、处置”闭环控制，不合格品一律不得出厂。若供货后发生质量问题，我公司接通知后立即响应，无偿修复或更换并承担相应损失，随后完成原因分析、纠正和预防措施制定，并向买方提交书面整改报告。",
+    )))
+    _child(section, "improvement", "持续改进", paragraph(ctx.pick(
+        "公司定期开展内部审核、管理评审和质量分析会，运用 QC 小组、统计过程控制（SPC）等方法持续改进产品质量与过程能力；主动收集用户意见和运行反馈，纳入产品与工艺改进计划。",
+        "公司定期开展内部审核、管理评审及质量分析会，借助 QC 小组、统计过程控制（SPC）等工具不断提升产品质量和过程能力；用户意见与运行反馈由专人主动收集，并纳入产品和工艺改进计划。",
+        "通过内部审核、管理评审和质量分析会等机制，结合 QC 小组活动、统计过程控制（SPC）等方法，公司持续改进产品质量与过程能力；同时主动收集用户意见和运行反馈，作为产品与工艺改进计划的输入。",
+    )))
 
 
 def build_test_reports(ctx: ComposeContext, section: Section) -> None:
@@ -563,14 +663,22 @@ def build_commitment_letter(ctx: ComposeContext, section: Section) -> None:
 
 def build_prequalification_notice(ctx: ComposeContext, section: Section) -> None:
     rows = [[lot["lot_code"], lot["lot_name"], lot.get("prequalification") or "见招标文件第一章附件2"] for lot in ctx.lots]
-    section.blocks.append(paragraph("我方所投标包对应的资格预审标段均已取得资格预审合格通知书，通知书涵盖全部所投分标对应的预审标段。"))
+    section.blocks.append(paragraph(ctx.pick(
+        "我方所投标包对应的资格预审标段均已取得资格预审合格通知书，通知书涵盖全部所投分标对应的预审标段。",
+        "我方所投标包对应的各预审标段均已通过资格预审并取得合格通知书，通知书覆盖全部所投分标对应的预审标段。",
+        "就所投标包对应的资格预审标段，我方均已取得资格预审合格通知书，全部所投分标对应的预审标段均在通知书范围内。",
+    )))
     if rows:
         section.blocks.append(table(["分标编号", "分标名称", "对应资格预审标段要求"], rows, widths=[3.8, 3.6, 9.0]))
     section.blocks += certificate_blocks(ctx, ("prequalification",), "资格预审结果通知书复印件")
 
 
 def build_technical_other(ctx: ComposeContext, section: Section) -> None:
-    section.blocks.append(paragraph("为进一步说明我方履约保障能力，补充提交供货组织与交付保障方案、实物 ID 实施方案及风险应对措施。"))
+    section.blocks.append(paragraph(ctx.pick(
+        "为进一步说明我方履约保障能力，补充提交供货组织与交付保障方案、实物 ID 实施方案及风险应对措施。",
+        "为更全面地说明我方履约保障能力，现补充提交供货组织与交付保障方案、实物 ID 实施方案和风险应对措施。",
+        "我方另补充提交供货组织与交付保障方案、实物 ID 实施方案及风险应对措施，以进一步说明履约保障能力。",
+    )))
     _child(
         section,
         "supply",
@@ -588,7 +696,11 @@ def build_technical_other(ctx: ComposeContext, section: Section) -> None:
             ],
         ),
     )
-    _child(section, "identity", "实物 ID 实施方案", paragraph("我公司已建立实物 ID 管理流程：依据供货单在电子商务平台申请实物 ID 编码，生产完成后在产品本体及盘具指定位置安装二维码标签和 RFID 电子标签，标签材质、尺寸、内容及安装位置满足国家电网公司相关技术规范及安装指导手册要求，出厂前逐一扫码校验，确保“账、卡、物”一致。"))
+    _child(section, "identity", "实物 ID 实施方案", paragraph(ctx.pick(
+        "我公司已建立实物 ID 管理流程：依据供货单在电子商务平台申请实物 ID 编码，生产完成后在产品本体及盘具指定位置安装二维码标签和 RFID 电子标签，标签材质、尺寸、内容及安装位置满足国家电网公司相关技术规范及安装指导手册要求，出厂前逐一扫码校验，确保“账、卡、物”一致。",
+        "我公司的实物 ID 管理流程如下：按供货单在电子商务平台申请实物 ID 编码；产品生产完成后，在本体及盘具的指定位置安装二维码标签和 RFID 电子标签，其材质、尺寸、内容和安装位置均符合国家电网公司相关技术规范及安装指导手册；出厂前逐一扫码校验，保证“账、卡、物”一致。",
+        "实物 ID 方面，我公司已形成成熟的管理流程——先依据供货单在电子商务平台申请实物 ID 编码，生产完成后在产品本体和盘具指定位置安装二维码标签与 RFID 电子标签（材质、尺寸、内容、安装位置均满足国家电网公司相关技术规范及安装指导手册要求），出厂前再逐一扫码校验，做到“账、卡、物”一致。",
+    )))
     _child(section, "risk", "履约风险识别与应对措施", table(
         ["风险类别", "风险描述", "应对措施"],
         [
@@ -608,4 +720,8 @@ def build_technical_other(ctx: ComposeContext, section: Section) -> None:
             paragraph(f"{ctx.company_name}对照招标文件技术评分标准中的质量问题扣分情形进行了自查：" + ("截至投标截止日，我公司不存在所列抽检质量问题扣分情形。" if clean else ctx.need("抽检质量问题自查情况"))),
             ctx.signature_block(),
         ]
-    section.blocks.append(paragraph("除上述内容外，我方无其他需要说明的技术文件。评标过程中如需澄清或补充，我方将按评标委员会要求及时提供。"))
+    section.blocks.append(paragraph(ctx.pick(
+        "除上述内容外，我方无其他需要说明的技术文件。评标过程中如需澄清或补充，我方将按评标委员会要求及时提供。",
+        "除以上内容外，我方没有其他需要说明的技术文件。评标期间如需澄清或补充材料，我方将按评标委员会的要求及时提交。",
+        "上述内容之外，我方无其他需说明的技术文件；评标过程中评标委员会要求澄清或补充的，我方将及时提供。",
+    )))

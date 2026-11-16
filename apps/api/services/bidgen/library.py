@@ -21,7 +21,6 @@ from api.services.bidgen.profile import (
     ProfileStore, normalize_certificate, parse_validity_text,
 )
 from api.services.knowledge.access import TENDER_LIB_PUBLIC_ID
-from api.services.knowledge.expiry import expiry_fields
 from api.services.knowledge.ingest import read_extracted_text, resolve_storage_path
 from api.services.tenders.company_identity import company_from_document, same_company
 from api.services.tenders.facts import view_facts
@@ -100,7 +99,7 @@ def _read_document(document, parent, base_id: str) -> LibraryDocument | None:
     )
 
 
-async def _load_library_records(db):
+async def load_library_documents(db) -> list[LibraryDocument]:
     """与 TenderLibraryView 共用 tenderlib01；不触发建库、迁移或重新 OCR。"""
     result = await db.execute(select(KnowledgeBase).where(
         KnowledgeBase.public_id == TENDER_LIB_PUBLIC_ID, KnowledgeBase.status != "deleted",
@@ -113,48 +112,22 @@ async def _load_library_records(db):
         ))
         base = result.scalar_one_or_none()
     if base is None:
-        return None, []
+        return []
     result = await db.execute(select(KnowledgeDocument).where(KnowledgeDocument.base_id == base.id)
                               .order_by(KnowledgeDocument.updated_at.desc(), KnowledgeDocument.id.desc()))
     records = list(result.scalars().all())
     by_id = {document.public_id: document for document in records}
-    approved = []
+    documents = []
     for record in records:
         parent = by_id.get(record.parent_id)
         if record.review_status != "approved" or record.status == "deleted":
             continue
         if parent and (parent.review_status != "approved" or parent.status == "deleted"):
             continue
-        approved.append((record, parent))
-    return base, approved
-
-
-async def load_library_documents(db) -> list[LibraryDocument]:
-    """匹配所需正文；不创建库、迁移或触发 OCR。"""
-    base, records = await _load_library_records(db)
-    documents = []
-    for record, parent in records:
         document = await run_in_threadpool(_read_document, record, parent, base.public_id)
         if document:
             documents.append(document)
     return documents
-
-
-async def load_library_expiry(db) -> list[dict]:
-    """全库已审核资料的临期提醒，不依赖证件分类、OCR 或原件可读性。"""
-    _base, records = await _load_library_records(db)
-    items = []
-    for record, parent in records:
-        validity = expiry_fields(record)
-        if validity["expire_status"] not in {"expired", "expiring"}:
-            continue
-        items.append({
-            "documentId": record.public_id,
-            "name": record.name or "未命名资料",
-            "source": getattr(parent, "name", "") or "投标资料库",
-            **validity,
-        })
-    return sorted(items, key=lambda item: (item["expire_days"], item["documentId"]))
 
 
 def _flatten(patch: dict, prefix: str = "") -> dict:
@@ -166,6 +139,27 @@ def _flatten(patch: dict, prefix: str = "") -> dict:
         elif value != "" and value != []:
             fields[path] = value
     return fields
+
+
+_SUGGESTION_GROUPS = {"company", "legalRep", "agent", "techLead", "staff", "service"}
+
+
+def _collect_suggestions(suggestions: dict, patch: dict, document, owner: str) -> None:
+    """资料库识别出的单值字段，连同来源一起留给页面展示；主体不一致的资料也展示，但标明主体。"""
+    for path, value in _flatten(patch).items():
+        if path.split(".")[0] not in _SUGGESTION_GROUPS or not isinstance(value, (str, int, float)) or isinstance(value, bool):
+            continue
+        entries = suggestions.setdefault(path, [])
+        if all(str(entry["value"]) != str(value) for entry in entries):
+            entries.append({"value": str(value), "documentId": document.public_id, "name": document.name,
+                            "title": document.title, "owner": owner})
+
+
+def _profile_value(profile: dict, path: str) -> str:
+    value: object = profile
+    for key in path.split("."):
+        value = value.get(key, "") if isinstance(value, dict) else ""
+    return str(value or "").strip()
 
 
 def _assign(patch: dict, path: str, value) -> None:
@@ -180,18 +174,6 @@ def _row_identity(group: str, row: dict) -> str:
     if group == "certificates":
         return str(row.get("id", ""))
     return label_key(row.get(ROW_KEYS.get(group, "name"), ""))
-
-
-def _candidate_priority(group: str, key: str, source: dict) -> int:
-    """财务字段优先采用审计财务表，避免说明书中的不同口径清空结果。"""
-    if group != "finance" or key != "revenue":
-        return 0
-    text = f"{source.get('name', '')} {source.get('title', '')}"
-    if "财务状况表" in text or "审计" in text:
-        return 30
-    if "财务信息" in text or "财务" in text:
-        return 20
-    return 0
 
 
 def _merge_values(current, candidate, previous, *, group: str = ""):
@@ -297,13 +279,24 @@ def _exclude_other_people(parsed: list, current: dict, previous: dict, warnings:
             excluded.update(document.public_id for document, _person in people)
             warnings.append(f"资料库包含多位{label}，请先填写本次使用的姓名或身份证号并重新匹配。")
             continue
+        anonymous = []
         for document, person in people:
             name, identity = person.get("name", ""), person.get("idNumber", "")
-            if ((selected_name and name and selected_name != name)
+            if not name and not identity:
+                anonymous.append(document)
+            elif ((selected_name and name and selected_name != name)
                     or (selected_id and identity and selected_id != identity)
-                    or (selected_name and not name and identity and identity != selected_id)
-                    or (len(people) > 1 and not name and not identity)):
+                    or (selected_name and not name and identity and identity != selected_id)):
                 excluded.add(document.public_id)
+        # 身份证反面只有签发机关和有效期限，没有姓名、证号：本组只涉及一个人时归这个人，
+        # 涉及多人时无法确定归属，不贴并提示，避免把别人的反面贴进来。
+        identified = [document for document, person in people
+                      if person.get("name") or person.get("idNumber")]
+        single_person = not any(document.public_id in excluded for document in identified)
+        if len(people) > 1 and anonymous and (not identified or not single_person):
+            excluded.update(document.public_id for document in anonymous)
+            warnings.append(f"资料库中{label}的部分资料（如身份证反面）未识别到姓名或证号，无法确定属于哪一位，"
+                            "未自动贴入；请在资料库中按人分开存放后重新匹配。")
     return excluded
 
 
@@ -331,12 +324,17 @@ def match_library_documents(store: ProfileStore, documents: list) -> dict:
     claimed_ids: set[str] = set()
     excluded_people = _exclude_other_people(parsed, current, previous, warnings)
     pending_count = 0
+    suggestions: dict[str, list[dict]] = {}
     for document, fields, patch, owner in parsed:
         if document.public_id in excluded_people:
             continue
         if owner == "__conflicting_company__" or (owner and bidder and not same_company(owner, bidder)):
-            warnings.append(f"{document.name}：企业主体不一致，未自动填入。")
+            subject = "资料中有多个企业主体" if owner == "__conflicting_company__" else f"资料主体为“{owner}”"
+            warnings.append(f"{document.title or document.name}（{document.name}）：{subject}，与投标人“{bidder}”不一致，"
+                            "未自动填入；识别结果已列在对应字段下，确认无误后可点“采用”，或先核对投标人名称。")
+            _collect_suggestions(suggestions, patch, document, owner if owner != "__conflicting_company__" else "多个企业主体")
             continue
+        _collect_suggestions(suggestions, patch, document, "")
         if multiple_companies and (not bidder or not owner):
             continue
         source = {"documentId": document.public_id, "name": document.name, "title": document.title}
@@ -357,8 +355,7 @@ def match_library_documents(store: ProfileStore, documents: list) -> dict:
             else:
                 rows: dict[str, dict] = {}
                 conflicts: set[tuple[str, str]] = set()
-                cell_sources: dict[tuple[str, str], dict] = {}
-                for items, source in entries:
+                for items, _source in entries:
                     for row in items:
                         identity = _row_identity(group, row)
                         target = rows.setdefault(identity, {})
@@ -366,21 +363,11 @@ def match_library_documents(store: ProfileStore, documents: list) -> dict:
                             if (identity, key) in conflicts:
                                 continue
                             if key in target and target[key] != value and target[key] != "" and value != "":
-                                previous_source = cell_sources.get((identity, key), {})
-                                new_priority = _candidate_priority(group, key, source)
-                                previous_priority = _candidate_priority(group, key, previous_source)
-                                if new_priority > previous_priority:
-                                    target[key] = value
-                                    cell_sources[(identity, key)] = source
-                                    continue
-                                if previous_priority > new_priority:
-                                    continue
                                 target.pop(key)
                                 conflicts.add((identity, key))
                                 warnings.append(f"{group} / {identity}：多份资料的 {key} 不一致，请手动核对。")
                             elif value != "":
                                 target[key] = value
-                                cell_sources[(identity, key)] = source
                             else:
                                 target.setdefault(key, value)
                 values = list(rows.values())
@@ -409,6 +396,10 @@ def match_library_documents(store: ProfileStore, documents: list) -> dict:
     return {"profile": profile, "libraryMatch": {
         "documentCount": len(documents), "matchedCount": sum(groups.values()), "groups": groups,
         "sources": sources, "warnings": list(dict.fromkeys(warnings)), "pendingCount": pending_count,
+        # 与当前资料不同的识别值（含主体不一致资料）：页面在字段下展示，由用户决定是否采用
+        "suggestions": {path: [entry for entry in entries if entry["value"] != _profile_value(profile, path)]
+                        for path, entries in suggestions.items()
+                        if any(entry["value"] != _profile_value(profile, path) for entry in entries)},
     }}
 
 

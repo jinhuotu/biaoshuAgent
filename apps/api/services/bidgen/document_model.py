@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import random
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -32,8 +33,40 @@ def numbering_label(level: int, index: int) -> str:
     return ""
 
 
+# 填空横线标记：私用区字符包住需加下划线的片段（源稿横线、已填入的值）。
+# 段落块里 text 永远是去掉标记的纯文字，带标记的原文另存于 form，仅供 Word 渲染使用。
+UNDERLINE_START = ""
+UNDERLINE_END = ""
+BLANK_UNDERLINE_WIDTH = 8  # 空白填空默认留出的全角空格数
+_UNDERLINE_MARKS = re.compile(f"[{UNDERLINE_START}{UNDERLINE_END}]")
+_ADJACENT_UNDERLINES = re.compile(rf"{UNDERLINE_END}(\s*){UNDERLINE_START}")
+_FILLED_UNDERLINE = re.compile(
+    rf"{UNDERLINE_START}\s*([^{UNDERLINE_START}{UNDERLINE_END}]*?\S)\s*{UNDERLINE_END}"
+)
+
+
+def underline(value: str) -> str:
+    """填空值加横线标记；值为空时留一段空白横线，等待手工补充。"""
+    text = str(value or "").strip()
+    return f"{UNDERLINE_START}{text or chr(0x3000) * BLANK_UNDERLINE_WIDTH}{UNDERLINE_END}"
+
+
+def strip_underline_marks(text: str) -> str:
+    return _UNDERLINE_MARKS.sub("", text)
+
+
+def tidy_underlines(form: str) -> str:
+    """相邻横线合并为一段；横线内已有文字时去掉原空白，横线只压在文字下。"""
+    merged = _ADJACENT_UNDERLINES.sub(r"\1", form)
+    return _FILLED_UNDERLINE.sub(lambda m: f"{UNDERLINE_START}{m.group(1).strip()}{UNDERLINE_END}", merged)
+
+
 def paragraph(text: str, *, bold: bool = False, align: str = "", indent: bool = True) -> dict:
-    return {"type": "paragraph", "text": text, "bold": bold, "align": align, "indent": indent}
+    block = {"type": "paragraph", "text": text, "bold": bold, "align": align, "indent": indent}
+    if _UNDERLINE_MARKS.search(text):
+        block["form"] = tidy_underlines(text)
+        block["text"] = strip_underline_marks(block["form"])
+    return block
 
 
 def table(header: list[str], rows: list[list[str]], *, caption: str = "", widths: list[float] | None = None) -> dict:
@@ -43,6 +76,45 @@ def table(header: list[str], rows: list[list[str]], *, caption: str = "", widths
 def form_table(rows: list[list[str]], *, caption: str = "", widths: list[float] | None = None) -> dict:
     """无表头的表单式表格（如基本情况表）；首列按标签加粗。"""
     return {"type": "table", "header": [], "rows": rows, "caption": caption, "widths": widths or [], "form": True}
+
+
+def label_cell(text: str, *, colspan: int = 1, rowspan: int = 1) -> tuple[str, int, int, bool]:
+    """合并表格中的标签单元格（加粗、底纹）。"""
+    return (text, colspan, rowspan, True)
+
+
+def value_cell(text: str, *, colspan: int = 1, rowspan: int = 1) -> tuple[str, int, int, bool]:
+    """合并表格中的内容单元格。"""
+    return (text, colspan, rowspan, False)
+
+
+def grid_table(cell_rows: list[list[tuple[str, int, int, bool]]], *, columns: int, widths: list[float] | None = None) -> dict:
+    """带跨行 / 跨列合并的表单表格，用于还原招标文件给定的表格版式。
+
+    ``cell_rows`` 每行从左到右列出未被上方跨行单元格占用的单元格。
+    """
+    rows = [[""] * columns for _ in cell_rows]
+    occupied = [[False] * columns for _ in cell_rows]
+    merges: list[list[int]] = []
+    labels: list[list[int]] = []
+    for row_index, cells in enumerate(cell_rows):
+        column = 0
+        for text, colspan, rowspan, is_label in cells:
+            while column < columns and occupied[row_index][column]:
+                column += 1
+            if column + colspan > columns or row_index + rowspan > len(cell_rows):
+                raise ValueError(f"合并表格第 {row_index + 1} 行超出表格范围")
+            for covered_row in range(row_index, row_index + rowspan):
+                for covered_column in range(column, column + colspan):
+                    occupied[covered_row][covered_column] = True
+            rows[row_index][column] = text
+            if is_label:
+                labels.append([row_index, column])
+            if colspan > 1 or rowspan > 1:
+                merges.append([row_index, column, row_index + rowspan - 1, column + colspan - 1])
+            column += colspan
+    return {"type": "table", "header": [], "rows": rows, "caption": "", "widths": widths or [],
+            "merges": merges, "labels": labels}
 
 
 def placeholder(text: str, *, height: float = 6.0) -> dict:
@@ -75,6 +147,7 @@ class Section:
     page_break: bool = False
     number: str = ""
     source: str = ""  # 对应招标文件格式目录的条目号
+    fixed: bool = False  # 招标文件给定的固定格式，多次生成时措辞不得变化
 
     @property
     def heading(self) -> str:
@@ -140,10 +213,13 @@ class ComposeContext:
     profile: dict
     lots: list[dict]
     options: dict
-    certificate_files: dict[str, str] = field(default_factory=dict)  # 证件 id → 图片路径
+    certificate_files: dict[str, str] = field(default_factory=dict)  # 证件 id → 图片 / PDF 原件路径
     certificate_check: dict = field(default_factory=dict)
     pending: list[dict] = field(default_factory=list)
     review_items: list[dict] = field(default_factory=list)
+    coverage: list[dict] = field(default_factory=list)  # 评分点覆盖自检记录
+    corpus_hits: list[dict] = field(default_factory=list)  # 复用的历史标书章节
+    rng: random.Random | None = None  # 措辞随机源；为空时始终取第一种表述
     _section_key: str = ""
 
     # ---- 取值辅助 ----
@@ -205,6 +281,17 @@ class ComposeContext:
         return any("电缆" in name for name in (*self.categories, *(s.get("model", "") for s in self.tender.get("tech_specs", []))))\
             or any(re.match(r"(?i)YJ|VV|VLV", s.get("model", "")) for s in self.tender.get("tech_specs", []))
 
+    def pick(self, *variants: str) -> str:
+        """同一含义的多种表述中取一种，使同一招标文件多次生成的正文不雷同。"""
+        return self.rng.choice(variants) if self.rng else variants[0]
+
+    def enumerate_clauses(self, clauses: list[str], *, shuffle: bool = True) -> str:
+        """把并列措施写成“（1）…；（2）…。”；并列项之间无先后关系时可打乱顺序。"""
+        ordered = list(clauses)
+        if shuffle and self.rng:
+            self.rng.shuffle(ordered)
+        return "；".join(f"（{index}）{clause}" for index, clause in enumerate(ordered, start=1)) + "。"
+
     def within_section(self, key: str) -> None:
         self._section_key = key
 
@@ -247,7 +334,8 @@ class ComposeContext:
         return f"{earliest.year}年{earliest.month}月{earliest.day}日至{latest.year}年{latest.month}月{latest.day}日"
 
     def signature_block(self, *extra: str, dated: bool = True) -> dict:
-        lines = [f"投标人：{self.company_name}（盖单位章）", *extra]
+        bidder = "供应商" if re.search(r"响应|磋商|谈判", self.tender.get("cover_title") or "") else "投标人"
+        lines = [f"{bidder}：{self.company_name}（盖单位章）", *extra]
         if dated:
             lines.append(f"日期：{self.sign_date}")
         return signature(lines)

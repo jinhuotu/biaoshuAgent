@@ -192,6 +192,36 @@ def test_different_people_are_never_combined(tmp_path):
     assert selected["legalRep"]["phone"] == ""
 
 
+def test_agent_id_back_without_name_is_kept_for_the_single_agent(tmp_path):
+    front, back = tmp_path / "front.png", tmp_path / "back.png"
+    front.write_bytes(b"front")
+    back.write_bytes(b"back")
+    docs = [document("front", title="授权代理人身份证", slot="id_agent", role="person/legal",
+                     fields={"姓名": "代理人甲", "身份证号": "999999199001010001"}, path=front),
+            document("back", title="授权代理人身份证", slot="id_agent", role="person/legal",
+                     fields={"签发机关": "某县公安局", "有效期限": "2020.01.01-2040.01.01"}, path=back)]
+    result = match(ProfileStore(tmp_path, 1), docs)
+    agent_ids = [c["libraryDocumentId"] for c in result["profile"]["certificates"] if c["category"] == "agent_id"]
+    assert sorted(agent_ids) == ["back", "front"]
+    assert result["profile"]["agent"]["name"] == "代理人甲"
+
+
+def test_unattributable_id_back_is_not_pasted_when_several_agents(tmp_path):
+    scan = tmp_path / "scan.png"
+    scan.write_bytes(b"scan")
+    docs = [document("a", title="授权代理人身份证", slot="id_agent", role="person/legal", fields={"姓名": "甲某", "身份证号": "A-ID"}, path=scan),
+            document("b", title="授权代理人身份证", slot="id_agent", role="person/legal", fields={"姓名": "乙某", "身份证号": "B-ID"}, path=scan),
+            document("back", title="授权代理人身份证", slot="id_agent", role="person/legal", fields={"签发机关": "某县公安局"}, path=scan)]
+    store = ProfileStore(tmp_path, 1)
+    profile = store.load()
+    profile["agent"]["name"] = "甲某"
+    store.save(profile)
+    result = match(store, docs)
+    agent_ids = [c["libraryDocumentId"] for c in result["profile"]["certificates"] if c["category"] == "agent_id"]
+    assert agent_ids == ["a"]
+    assert any("无法确定属于哪一位" in warning for warning in result["libraryMatch"]["warnings"])
+
+
 def test_multiple_certificates_keep_stable_distinct_ids(tmp_path):
     store = ProfileStore(tmp_path, 1)
     profile = store.load()
@@ -311,3 +341,58 @@ def test_word_library_tables_can_be_matched_before_ocr_finishes(tmp_path, monkey
     source = _read_document(record, None, "tenderlib01")
     result = match(ProfileStore(tmp_path, 1), [source])
     assert result["profile"]["finance"] == [{"year": "2025", "revenue": "1234.567890", "rdExpense": "50.000012"}]
+
+
+# 人工录入的营业执照 OCR 版面：标签被拆成单字、标签与值之间夹着二维码文字、住所与经营范围折行
+LICENSE_OCR = "\n".join([
+    "营业执照", "统一社会信用代码", "扫描二维码登录", "91410103MA3XF5E664", "信息公示系统", "(副本)(1-1)",
+    "名", "称", "河南测试计算机科技有限公司", "注册资本", "捌佰万圆整", "类", "型", "有限责任公司(自然人投资或控股)",
+    "成立日期", "2016年11月15日", "法定代表人", "张某", "住", "所", "河南省郑州市管城回族区郑汴路",
+    "76号绿都广场1单元23层2308号", "经营范围", "计算机软件开发，销售，售后服务，技术咨询，技术",
+    "转让；计算机硬件及辅助设备的销售；通讯设备，办", "公用品销售。", "登记机关", "2025",
+])
+
+
+def test_license_ocr_layout_is_read_without_model(tmp_path):
+    from api.services.bidgen.library_fields import extract_profile_fields
+
+    patch = extract_profile_fields(fields=[], text=LICENSE_OCR, slot="license", title="营业执照", role="")
+    assert patch["company"] == {
+        "creditCode": "91410103MA3XF5E664",
+        "name": "河南测试计算机科技有限公司",
+        "registeredCapital": "捌佰万圆整",
+        "orgStructure": "有限责任公司(自然人投资或控股)",
+        "foundedDate": "2016-11-15",
+        "address": "河南省郑州市管城回族区郑汴路76号绿都广场1单元23层2308号",
+        "businessScope": "计算机软件开发，销售，售后服务，技术咨询，技术转让；计算机硬件及辅助设备的销售；通讯设备，办公用品销售。",
+    }
+    assert patch["legalRep"] == {"name": "张某"}
+    # 截图里“地址”后面的菜单文字不是地址
+    screenshot = extract_profile_fields(fields=[], text="地址\n四销售订单类\n客户名称", slot="safety", title="安全生产许可证", role="")
+    assert "address" not in screenshot.get("company", {})
+
+
+def test_other_company_license_is_shown_as_suggestion_not_filled(tmp_path):
+    store = ProfileStore(tmp_path, 1)
+    saved = store.load()
+    saved["company"]["name"] = "河南测试信息技术有限公司"
+    store.save(saved)
+    license_doc = document("lic", title="营业执照", slot="license", text=LICENSE_OCR, role="")
+    license_doc.summary = ""
+    result = match(store, [license_doc])
+    company = result["profile"]["company"]
+    assert company["registeredCapital"] == "" and company["foundedDate"] == ""  # 主体不一致不自动填入
+    suggestions = result["libraryMatch"]["suggestions"]
+    assert suggestions["company.registeredCapital"][0]["value"] == "捌佰万圆整"
+    assert suggestions["company.registeredCapital"][0]["owner"] == "河南测试计算机科技有限公司"
+    assert suggestions["company.name"][0]["value"] == "河南测试计算机科技有限公司"
+    assert any("河南测试计算机科技有限公司" in warning for warning in result["libraryMatch"]["warnings"])
+
+    # 采用执照上的企业名称后重新匹配：同一主体，执照内容自动填入，候选值不再重复显示
+    saved = store.load()
+    saved["company"]["name"] = "河南测试计算机科技有限公司"
+    store.save(saved)
+    result = match(store, [license_doc])
+    assert result["profile"]["company"]["registeredCapital"] == "捌佰万圆整"
+    assert result["profile"]["company"]["foundedDate"] == "2016-11-15"
+    assert "company.registeredCapital" not in result["libraryMatch"]["suggestions"]

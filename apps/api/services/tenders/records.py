@@ -156,10 +156,6 @@ def _record_to_dict(
     from api.services.tenders.qa import qa_summary
 
     data.update(qa_summary(row.public_id))
-    meta = (row.brief_json or {}).get("_bidgen")
-    if isinstance(meta, dict) and meta.get("taskId"):
-        data.update(source="bidgen", sourceTaskId=meta["taskId"], sourceGeneratedAt=meta.get("generatedAt"),
-                    ruleScore=meta.get("scoreCheck"), certificateCheck=meta.get("certificateCheck"))
     if include_brief and isinstance(row.brief_json, dict):
         data["brief"] = row.brief_json
     if extra:
@@ -611,8 +607,7 @@ async def _prepare_and_generate(
     brief.includeSlotKeys = include_keys
     slots = collect_slots(brief.extraPlaceholders, catalog=catalog, include_keys=include_keys,
                           outline_items=brief.outlineItems)
-    material_match_report = {}
-    media = await resolve_attachments(db, slots, report=material_match_report)
+    media = await resolve_attachments(db, slots)
     from api.services.tenders.slots import attach_invitation_drawings
 
     media = attach_invitation_drawings(media, brief.invitationId)
@@ -799,46 +794,8 @@ async def _prepare_and_generate(
         brief.bizDeviationLines = prepared.bizDeviationLines
         brief.bizDevHeaders = prepared.bizDevHeaders
         draft_notes.extend(biz_notes)
-    from api.services.tenders.docx_materials import hydrate_docx_media
-
-    media, docx_material_reports = hydrate_docx_media(media)
-    for report in docx_material_reports:
-        logger.info("docx material hydrate %s", json.dumps(report, ensure_ascii=False))
-        if report["mode"] == "failed":
-            note = (f"资料《{report['title']}》是 Word 原件，无法转换为可插入的图片或 PDF，"
-                    f"已保留占位：{report['reason']}")
-            if note not in material_notes:
-                material_notes.append(note)
-    diagnostic_titles = {slot.key: slot.title or slot.key for slot in slots}
-    truly_missing, rejected_existing, hydrated = [], [], []
-    replaced_missing_titles = set()
-    superseded_word_notes = set()
-    for key in dict.fromkeys(checked_keys):
-        title = diagnostic_titles.get(key) or key
-        matched = material_match_report.get(key, {})
-        word_reports = [row for row in docx_material_reports if row['key'] == key]
-        failed = [row for row in word_reports if row['mode'] == 'failed']
-        if not media.get(key):
-            if matched.get('candidates', 0) == 0:
-                truly_missing.append(title)
-                continue
-            reasons = list(dict.fromkeys(matched.get('reasons') or []))[:3]
-            reason = '、'.join(reasons) or '本次范围核验后无可用文件'
-            note = f"资料库《{title}》有 {matched['candidates']} 个文件，本次未采用：{reason}"
-            if failed:
-                word_reasons = list(dict.fromkeys(row['reason'] for row in failed))
-                note += '；Word 转换失败：' + '、'.join(word_reasons)
-            rejected_existing.append(note)
-        elif any(row['mode'] != 'failed' for row in word_reports):
-            hydrated.append(f'资料《{title}》已转换为可插入文件并落位')
-        else:
-            continue
-        replaced_missing_titles.add(title)
-        for row in failed:
-            superseded_word_notes.add(
-                f"资料《{row['title']}》是 Word 原件，无法转换为可插入的图片或 PDF，"
-                f"已保留占位：{row['reason']}"
-            )
+    media = {key: [path for path in files if Path(path).suffix.lower() not in {'.doc', '.docx'}]
+             for key, files in media.items()}
     catalog_facts = list(facts)
     if scoring_drafts:
         catalog_facts.append({"_scoring_drafts": scoring_drafts})
@@ -927,38 +884,6 @@ async def _prepare_and_generate(
     placed_word_titles = {section_key(row['targetTitle']) for row in generated.get('wordMaterialOutcomes', []) if row['status'] in {'copied', 'filled'}}
     warnings = [warning for warning in warnings if not (isinstance(warning, str)
                 and warning.startswith('资料库缺少') and section_key(warning.removeprefix('资料库缺少').split('，请')[0]) in placed_word_titles)]
-    warnings = [warning for warning in warnings if warning not in superseded_word_notes
-                and not (isinstance(warning, str) and warning.startswith('资料库缺少')
-                         and warning.removeprefix('资料库缺少').split('，请')[0]
-                         in replaced_missing_titles)]
-    warnings.extend(note for note in [*rejected_existing, *hydrated] if note not in warnings)
-    from api.services.tenders.table_fill import fact_values, fill_label_tables, report_lines
-    from docx import Document
-
-    docx_name = str(generated.get('docxFile') or '')
-    if docx_name:
-        path = tenders_output_dir() / docx_name
-        try:
-            document = Document(path)
-            before_rows = [len(table.rows) for table in document.tables]
-            # Table-only facts may reuse Word sources already verified for this bidder.
-            table_facts = [fact for fact in await library_facts(db)
-                           if fact.get('fileId') in company_file_ids]
-            values, conflicts = fact_values(table_facts)
-            report = fill_label_tables(
-                document, values, bidder_name=brief.bidderName,
-                skip_labels={'投标人名称', '注册地址', '法定代表人', '成立时间'},
-            )
-            report['conflicts'] = conflicts
-            after_rows = [len(table.rows) for table in document.tables]
-            if before_rows != after_rows:
-                raise RuntimeError('表格结构发生变化')
-            if report['filled']:
-                document.save(path)
-            warnings.extend(report_lines(report))
-            generated['tableFillReport'] = report
-        except Exception as exc:
-            warnings.append(f'表格自动填写跳过：{type(exc).__name__}')
     generated["warnings"] = warnings
     attachment_match['wordMaterials'] = generated.get('wordMaterialOutcomes') or []
     return generated, attachment_match
@@ -1244,14 +1169,13 @@ async def get_record(db: AsyncSession, public_id: str) -> dict[str, object]:
     return _record_to_dict(row, include_brief=True, extra=extra)
 
 
-async def _get_row(db: AsyncSession, public_id: str, *, lock: bool = False) -> TenderRecord:
+async def _get_row(db: AsyncSession, public_id: str) -> TenderRecord:
     pid = (public_id or "").strip()
     if not pid:
         raise AppError(ErrorCode.BAD_REQUEST, "missing record id", status_code=400)
-    statement = select(TenderRecord).where(TenderRecord.public_id == pid)
-    if lock:
-        statement = statement.with_for_update()
-    row = (await db.execute(statement)).scalar_one_or_none()
+    row = (
+        await db.execute(select(TenderRecord).where(TenderRecord.public_id == pid))
+    ).scalar_one_or_none()
     if row is None:
         raise AppError(ErrorCode.NOT_FOUND, "tender record not found", status_code=404)
     return row
@@ -1348,8 +1272,6 @@ async def regenerate_from_record(
     """用当前表单（或记录快照）覆盖同一条记录的 Word，不改工作流状态。"""
     row = await _get_row(db, public_id)
     _assert_owner_or_admin(row, user, admin=admin)
-    if (row.brief_json or {}).get("_bidgen"):
-        raise AppError(ErrorCode.VALIDATION, "新版任务请从新版标书生成页编辑和重新生成", status_code=422)
     if workflow_locked(row.status):
         raise AppError(ErrorCode.VALIDATION, "当前状态不可重新生成，请先驳回或解锁", status_code=422)
     if brief is None:
@@ -1432,7 +1354,7 @@ async def submit_for_approval(
     user: User,
     admin: bool,
 ) -> dict[str, object]:
-    row = await _get_row(db, public_id, lock=True)
+    row = await _get_row(db, public_id)
     _assert_owner_or_admin(row, user, admin=admin)
     if (row.status or STATUS_PROCESSING) != STATUS_PROCESSING:
         raise AppError(ErrorCode.VALIDATION, "只有编制中的任务可以提交审批", status_code=422)

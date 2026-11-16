@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from xml.etree import ElementTree
 
+from api.services.bidgen.document_model import UNDERLINE_END, UNDERLINE_START
+
 _W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 _HEADING_STYLE = re.compile(r"(?i)^(?:heading|标题)\s*(\d)$")
 
@@ -21,18 +23,40 @@ class DocBlock:
     style: str = ""
     level: int = 0  # 0 = 普通正文；1..9 = 标题层级
     rows: list[list[str]] = field(default_factory=list)
+    form: str = ""  # 段落含下划线时：带横线标记的原文（见 document_model.UNDERLINE_START）；否则为空
+
+
+def _run_underlined(run: ElementTree.Element) -> bool:
+    line = run.find(f"{_W}rPr/{_W}u")
+    return line is not None and line.get(f"{_W}val", "single") not in ("none", "0", "false", "off")
+
+
+def _paragraph_pieces(paragraph: ElementTree.Element) -> list[tuple[str, bool]]:
+    """段落文字片段及其是否带下划线（填空横线）。"""
+    pieces: list[tuple[str, bool]] = []
+    underlined = False
+    for node in paragraph.iter():
+        if node.tag == f"{_W}r":
+            underlined = _run_underlined(node)
+        elif node.tag == f"{_W}t":
+            pieces.append((node.text or "", underlined))
+        elif node.tag == f"{_W}tab":
+            pieces.append((" ", underlined))
+        elif node.tag in (f"{_W}br", f"{_W}cr"):
+            pieces.append(("\n", False))
+    return pieces
 
 
 def _paragraph_text(paragraph: ElementTree.Element) -> str:
-    pieces: list[str] = []
-    for node in paragraph.iter():
-        if node.tag == f"{_W}t":
-            pieces.append(node.text or "")
-        elif node.tag == f"{_W}tab":
-            pieces.append(" ")
-        elif node.tag in (f"{_W}br", f"{_W}cr"):
-            pieces.append("\n")
-    return "".join(pieces)
+    return "".join(text for text, _ in _paragraph_pieces(paragraph))
+
+
+def _paragraph_form(paragraph: ElementTree.Element) -> str:
+    """带横线标记的段落原文；整段没有下划线时返回空串。"""
+    pieces = _paragraph_pieces(paragraph)
+    if not any(underlined and text for text, underlined in pieces):
+        return ""
+    return "".join(f"{UNDERLINE_START}{text}{UNDERLINE_END}" if underlined else text for text, underlined in pieces).strip()
 
 
 def _read_style_names(package: zipfile.ZipFile) -> tuple[dict[str, str], dict[str, int]]:
@@ -98,13 +122,22 @@ def read_docx_blocks(path: Path) -> list[DocBlock]:
                 value = int(outline.get(f"{_W}val", "9"))
                 level = value + 1 if value < 9 else 0
             blocks.append(
-                DocBlock(kind="paragraph", text=text, style=style_names.get(style_id, style_id), level=level)
+                DocBlock(kind="paragraph", text=text, style=style_names.get(style_id, style_id), level=level,
+                         form=_paragraph_form(element))
             )
         elif element.tag == f"{_W}tbl":
             rows = _table_rows(element)
             if rows:
                 blocks.append(DocBlock(kind="table", rows=rows))
     return blocks
+
+
+def template_paragraph(block: DocBlock) -> dict:
+    """格式原文段落 → 模板项；源稿有填空横线时一并带上 form。"""
+    item = {"kind": "paragraph", "text": block.text}
+    if block.form:
+        item["form"] = block.form
+    return item
 
 
 def blocks_to_text(blocks: list[DocBlock]) -> str:

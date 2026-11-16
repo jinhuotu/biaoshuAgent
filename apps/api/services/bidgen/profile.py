@@ -8,9 +8,6 @@ from copy import deepcopy
 from datetime import date, datetime
 from pathlib import Path
 from uuid import uuid4
-from zoneinfo import ZoneInfo
-
-from common.config import get_settings
 
 CERT_STATUS_VALID = "valid"
 CERT_STATUS_EXPIRING = "expiring"
@@ -46,6 +43,20 @@ CERT_CATEGORIES = {
     "ccc": ("CCC 强制性产品认证证书", False),
     "type_test": ("型式试验报告", False),
     "prequalification": ("资格预审结果通知书", False),
+    "credit_gsxt": ("国家企业信用信息公示报告", False),
+    "credit_china": ("信用中国报告", False),
+    "credit_report": ("信用查询报告及截图", False),
+    "itss": ("信息技术服务管理体系认证证书（ISO/IEC 20000）", False),
+    "isms": ("信息安全管理体系认证证书（ISO/IEC 27001）", False),
+    "cmmi": ("能力成熟度（CMMI）评估证书", False),
+    "qualification": ("企业资质证书", False),
+    "safety_license": ("安全生产许可证", False),
+    "bank_permit": ("开户许可证 / 基本存款账户信息", False),
+    "bid_bond": ("投标保证金缴纳凭证", False),
+    "finance_report": ("财务审计报告 / 完税证明", False),
+    "social_insurance": ("社保缴纳证明", False),
+    "performance_proof": ("类似项目合同及发票", False),
+    "product_report": ("所投产品检测报告 / 认证", False),
     "other": ("其他证明材料", False),
 }
 
@@ -340,15 +351,12 @@ def parse_validity_text(text: str) -> dict | None:
     return {"validFrom": dates[0] if len(dates) > 1 else "", "validTo": dates[-1], "perpetual": False}
 
 
-def check_certificates(profile: dict, bid_deadline: str, validity_end: str, warn_days: int | None = None) -> dict:
+def check_certificates(profile: dict, bid_deadline: str, validity_end: str, warn_days: int = 30) -> dict:
     """逐证件校验有效期，并检查必备证件是否齐全。
 
     判定基准：今天、投标截止日、投标有效期届满日。
     """
-    today = datetime.now(ZoneInfo("Asia/Shanghai")).date()
-    if warn_days is None:
-        settings = get_settings()
-        warn_days = max(settings.expire_warn_days, settings.expire_danger_days)
+    today = date.today()
     deadline = datetime.fromisoformat(bid_deadline).date() if bid_deadline else None
     validity = date.fromisoformat(validity_end) if validity_end else None
     items = []
