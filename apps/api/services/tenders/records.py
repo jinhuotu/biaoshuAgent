@@ -153,6 +153,11 @@ def _record_to_dict(
             for volume in ('business','technical','full')
         }
     data.update(volume_pair_status(stored, business_ready=docx_ok, technical_ready=tech_ok))
+    from api.services.bidgen.task_bridge import source_of
+    source = source_of(row)
+    if source:
+        data.update({"source": "bidgen", "sourceTaskId": source.get("taskId"),
+                     "versionConfirmed": bool(source.get("confirmedAt"))})
     from api.services.tenders.qa import qa_summary
 
     data.update(qa_summary(row.public_id))
@@ -1178,6 +1183,11 @@ async def _get_row(db: AsyncSession, public_id: str) -> TenderRecord:
     ).scalar_one_or_none()
     if row is None:
         raise AppError(ErrorCode.NOT_FOUND, "tender record not found", status_code=404)
+    from api.services.bidgen.task_bridge import source_of, find_record
+    if source_of(row):
+        row = await find_record(db, pid, lock=True)
+        if row is None:
+            raise AppError(ErrorCode.NOT_FOUND, "tender record not found", status_code=404)
     return row
 
 
@@ -1189,6 +1199,8 @@ def _assert_owner_or_admin(row: TenderRecord, user: User, *, admin: bool) -> Non
 
 
 def _purge_record_files(row: TenderRecord) -> list[str]:
+    from api.services.bidgen.task_bridge import purge_snapshot
+    purge_snapshot(row, remove_source=True)
     removed: list[str] = []
     for name in (row.docx_file, getattr(row, "tech_docx_file", None), row.pdf_file):
         if name:
@@ -1274,6 +1286,9 @@ async def regenerate_from_record(
     _assert_owner_or_admin(row, user, admin=admin)
     if workflow_locked(row.status):
         raise AppError(ErrorCode.VALIDATION, "当前状态不可重新生成，请先驳回或解锁", status_code=422)
+    from api.services.bidgen.task_bridge import source_of
+    if source_of(row):
+        raise AppError(ErrorCode.VALIDATION, "请从新版标书编制页面重新生成该任务", status_code=422)
     if brief is None:
         if not isinstance(row.brief_json, dict) or not row.brief_json:
             raise AppError(ErrorCode.VALIDATION, "该记录没有保存表单，无法重新生成", status_code=422)
@@ -1358,6 +1373,9 @@ async def submit_for_approval(
     _assert_owner_or_admin(row, user, admin=admin)
     if (row.status or STATUS_PROCESSING) != STATUS_PROCESSING:
         raise AppError(ErrorCode.VALIDATION, "只有编制中的任务可以提交审批", status_code=422)
+    from api.services.bidgen.task_bridge import require_confirmation, check_evidence
+    require_confirmation(row)
+    check_evidence(row)
     biz_ok = bool((row.docx_file or "").strip()) and (tenders_output_dir() / row.docx_file).is_file()
     tech_name = (getattr(row, "tech_docx_file", None) or "").strip()
     tech_ok = bool(tech_name) and (tenders_output_dir() / tech_name).is_file()
@@ -1410,6 +1428,10 @@ async def decide_approval(
     now = _now()
     if passed:
         new_status, new_step = next_step_on_pass(row.current_step, steps)
+        if new_status == STATUS_APPROVED:
+            from api.services.bidgen.task_bridge import check_evidence, require_confirmation
+            require_confirmation(row)
+            check_evidence(row, final=True)
         row.status = new_status
         row.current_step = new_step
         if new_status == STATUS_APPROVED:
@@ -1425,6 +1447,11 @@ async def decide_approval(
         )
     else:
         row.status = STATUS_PROCESSING
+        from api.services.bidgen.task_bridge import source_of
+        if source_of(row):
+            brief = dict(row.brief_json)
+            brief["bidgen"] = {k: v for k, v in source_of(row).items() if k != "confirmedAt"}
+            row.brief_json = brief
         row.current_step = KEY_SUBMIT
         row.decided_at = now
         await _add_log(
@@ -1455,6 +1482,10 @@ async def mark_result(
     row = await _get_row(db, public_id)
     _assert_owner_or_admin(row, user, admin=admin)
     current = row.status or STATUS_PROCESSING
+    if target in {STATUS_SUBMITTED, STATUS_WON}:
+        from api.services.bidgen.task_bridge import check_evidence, require_confirmation
+        require_confirmation(row)
+        check_evidence(row, final=True)
     if target == STATUS_SUBMITTED and current != STATUS_APPROVED:
         raise AppError(ErrorCode.VALIDATION, "审批通过后才能标记已提交", status_code=422)
     if target in {STATUS_WON, STATUS_LOST} and current not in {STATUS_APPROVED, STATUS_SUBMITTED}:

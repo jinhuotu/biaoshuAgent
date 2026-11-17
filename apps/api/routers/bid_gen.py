@@ -16,6 +16,7 @@ from api.services.bidgen.archive import ArchiveError
 from api.services.bidgen.corpus import CORPUS_SUFFIXES
 from api.services.bidgen.library import match_profile_from_library
 from api.services.bidgen.profile import CERT_CATEGORIES, check_certificates
+from api.services.bidgen import task_bridge
 from api.services.bidgen.service import (
     ALLOWED_UPLOAD_SUFFIXES, UNSUPPORTED_UPLOAD_MESSAGE, BidGenService, TaskNotFound,
 )
@@ -23,6 +24,7 @@ from api.services.knowledge.access import require_tender_lib_read
 from api.services.menus import can_access_menu
 from common.config import get_settings
 from common.response import ok
+from common.errors import AppError
 
 router = APIRouter(prefix="/bid-gen", tags=["bid-gen"])
 
@@ -55,6 +57,13 @@ class CertificateCheckRequest(BaseModel):
     task_id: str = Field(default="", alias="taskId")
 
 
+class ConfirmVersionRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    generated_at: str = Field(alias="generatedAt", max_length=64)
+    content_digest: str = Field(default="", alias="contentDigest", max_length=128)
+
+
 def _service(user) -> BidGenService:
     if not user_is_admin(user) and not can_access_menu(user, "/tenders"):
         raise HTTPException(403, "没有标书功能权限")
@@ -74,8 +83,20 @@ async def _guarded(function, *args):
 
 
 @router.get("/tasks")
-async def list_tasks(user: CurrentUser):
-    return ok(await _guarded(_service(user).list_tasks))
+async def list_tasks(user: CurrentUser, db: DbSession):
+    service = _service(user)
+    await task_bridge.lock_owner(db, user.id)
+    tasks = await _guarded(service.list_tasks)
+    # 既有新版生成记录在打开生成页时补登记，不要求重新生成标书。
+    for task in tasks:
+        await task_bridge.lock_owner(db, user.id)
+        row = await task_bridge.find_record(db, task["id"], lock=True)
+        if row is None and task["status"] == "generated":
+            detail = await _guarded(service.get_task, task["id"])
+            await task_bridge.register_result(db, service, detail, user)
+            row = await task_bridge.find_record(db, task["id"])
+        task.update(task_bridge.with_workflow({}, row))
+    return ok(tasks)
 
 
 @router.post("/tasks")
@@ -162,13 +183,24 @@ async def corpus_delete(source_id: str, user: CurrentUser):
 
 
 @router.get("/tasks/{task_id}")
-async def get_task(task_id: str, user: CurrentUser):
-    return ok(await _guarded(_service(user).get_task, task_id))
+async def get_task(task_id: str, user: CurrentUser, db: DbSession):
+    service = _service(user)
+    await task_bridge.lock_owner(db, user.id)
+    task = await _guarded(service.get_task, task_id)
+    return ok(await task_bridge.register_result(db, service, task, user))
 
 
 @router.delete("/tasks/{task_id}")
-async def delete_task(task_id: str, user: CurrentUser):
-    await _guarded(_service(user).delete_task, task_id)
+async def delete_task(task_id: str, user: CurrentUser, db: DbSession):
+    service = _service(user)
+    await task_bridge.lock_owner(db, user.id)
+    await _guarded(service.get_task, task_id)
+    row = await task_bridge.find_record(db, task_id, lock=True)
+    if row is not None:
+        from api.services.tenders.records import delete_record
+        await delete_record(db, row.public_id, user=user, admin=user_is_admin(user))
+    else:
+        await _guarded(service.delete_task, task_id)
     return ok({"id": task_id})
 
 
@@ -177,12 +209,69 @@ async def generate(task_id: str, body: GenerateRequest, user: CurrentUser, db: D
     """按当前企业资料生成投标文件，并同步完成评分自查与证件效期校验。"""
     selection = body.model_dump(by_alias=True)
     service = _service(user)
+    await task_bridge.lock_owner(db, user.id)
     await _guarded(service.get_task, task_id)
     if not user_is_admin(user):
         await require_tender_lib_read(db, user)
     # 可从解析页直接生成；即使没有打开资料页，也应匹配最新资料库附件。
     await match_profile_from_library(service.profiles, db)
-    return ok(await _guarded(service.generate, task_id, selection))
+    row = await task_bridge.find_record(db, task_id, lock=True)
+    task_bridge.assert_editable(row)
+    task = await _guarded(service.generate, task_id, selection)
+    try:
+        return ok(await task_bridge.register_result(db, service, task, user, row=row))
+    except AppError:
+        raise
+    except Exception as exc:
+        await db.rollback()
+        raise HTTPException(503, "文件已生成，但工作任务登记失败；请重新打开该任务重试登记") from exc
+
+
+@router.post("/tasks/{task_id}/confirm")
+async def confirm_task(task_id: str, body: ConfirmVersionRequest, user: CurrentUser, db: DbSession):
+    await task_bridge.lock_owner(db, user.id)
+    await _guarded(_service(user).get_task, task_id)
+    row = await task_bridge.find_record(db, task_id, lock=True)
+    if row is None or row.user_id != user.id:
+        raise HTTPException(404, "工作任务尚未登记，请重新打开任务")
+    task_bridge.assert_editable(row)
+    source = task_bridge.source_of(row)
+    if (body.generated_at != source.get("generatedAt")
+            or body.content_digest != source.get("contentDigest", "")):
+        raise HTTPException(409, "标书版本已更新，请重新打开任务，检查最新版本后再确认")
+    task_bridge.confirm_version(row)
+    await db.commit()
+    from api.services.tenders.records import _record_to_dict
+    return ok(_record_to_dict(row))
+
+
+async def _review_record(db, user, record_id: str):
+    row = await task_bridge.find_record(db, record_id)
+    if row is None or not task_bridge.source_of(row):
+        raise HTTPException(404, "新版任务不存在")
+    if not user_is_admin(user) and not any(can_access_menu(user, menu) for menu in (
+        "/tenders", "/tender-qa", "/work-tasks", "/tender-tasks", "/approval"
+    )):
+        raise HTTPException(403, "无权访问投标任务")
+    if row.user_id != user.id and not user_is_admin(user) and not any(
+        can_access_menu(user, menu) for menu in ("/tender-tasks", "/approval")
+    ):
+        raise HTTPException(403, "无权查看其他用户的投标文件")
+    return row
+
+
+@router.get("/records/{record_id}/review")
+async def record_review(record_id: str, user: CurrentUser, db: DbSession):
+    row = await _review_record(db, user, record_id)
+    snapshot = await _guarded(task_bridge.read_snapshot, row)
+    return ok(task_bridge.with_workflow(snapshot["task"], row))
+
+
+@router.get("/records/{record_id}/files/{file_name}")
+async def record_review_file(record_id: str, file_name: str, user: CurrentUser, db: DbSession):
+    row = await _review_record(db, user, record_id)
+    path = await _guarded(task_bridge.snapshot_file, row, file_name)
+    return FileResponse(path, filename=file_name, media_type=_MEDIA_TYPES.get(path.suffix.lower()))
 
 
 @router.get("/tasks/{task_id}/files/{file_name}")
