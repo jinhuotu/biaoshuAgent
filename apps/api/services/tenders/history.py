@@ -125,6 +125,12 @@ async def latest_company_profile(db: AsyncSession, *, bidder_name: str = "", lim
     """最近一次本公司投标里的公司/法人字段，供新邀请书空项回填。"""
     if not bidder_name.strip():
         return {}
+    from api.services.tenders.company_materials import library_company_profile
+    from api.services.tenders.library_scope import current_company_base
+
+    if current_company_base() is not None:
+        explicit, _ = await library_company_profile(db, BidBrief(bidderName=bidder_name))
+        return {"bidderName": bidder_name, **explicit}
     stmt = (
         select(TenderRecord)
         .where(TenderRecord.brief_json.is_not(None))
@@ -152,8 +158,6 @@ async def latest_company_profile(db: AsyncSession, *, bidder_name: str = "", lim
             continue
         profile.update(candidate, bidderName=name)
         break
-    from api.services.tenders.company_materials import library_company_profile
-
     explicit, conflicts = await library_company_profile(db, BidBrief.model_validate(profile))
     for field in conflicts:
         profile.pop(field, None)
@@ -163,7 +167,9 @@ async def latest_company_profile(db: AsyncSession, *, bidder_name: str = "", lim
 
 async def latest_agent_profile(db: AsyncSession, *, bidder_name: str = "", limit: int = 8) -> dict[str, str]:
     """最近一次启用过授权委托的姓名/证号，打开开关时回填。"""
-    if not bidder_name.strip():
+    from api.services.tenders.library_scope import current_company_base
+
+    if not bidder_name.strip() or current_company_base() is not None:
         return {}
     stmt = (
         select(TenderRecord)

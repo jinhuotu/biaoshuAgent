@@ -414,7 +414,14 @@ def _build_volume(ctx: ComposeContext, volume: str, key: str, title: str) -> Sec
         has_children = any(other["number"].startswith(item["number"] + ".") for other in items)
         builder = _pick_builder(volume, item["title"])
         ctx.within_section(section.key)
-        if has_children and builder is business.build_bid_bond:
+        if item.get("submission_mode") == "tool_generated":
+            section.fixed = True
+            section.blocks.append(paragraph(item["port"]))
+        elif item.get("submission_mode") == "conditional_deviation":
+            section.fixed = True
+            section.blocks.append(paragraph(item["port"]))
+            section.blocks += _render_template(ctx, item.get("template", []))
+        elif has_children and builder is business.build_bid_bond:
             builder(ctx, section)
             if section.not_applicable:
                 skipped_prefixes.append(item["number"] + ".")  # 保证金不适用时子项不再逐个展开

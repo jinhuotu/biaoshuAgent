@@ -39,6 +39,7 @@ from api.services.tenders.performance import (
     rank_performance_lines,
 )
 from api.services.tenders.match import find_catalog_item, same_library_material
+from api.services.tenders.library_scope import current_company_base
 from api.services.tenders.placeholders import DEFAULT_SLOTS, TECH_DRAWING_KEY, collect_slots
 from api.services.tenders.schema import PerformanceLine, PlaceholderItem
 from api.services.tenders.slots import (
@@ -60,6 +61,18 @@ TENDER_LIB_PUBLIC_ID = "tenderlib01"
 TENDER_LIB_NAME = "投标资料库"
 TAG_MATERIAL = "投标资料"
 TAG_SLOT_PREFIX = "slot:"
+
+
+def current_library_id() -> str:
+    base = current_company_base()
+    return base.public_id if base is not None else TENDER_LIB_PUBLIC_ID
+
+
+async def read_library_base(db: AsyncSession) -> KnowledgeBase:
+    base = current_company_base()
+    return base if base is not None else await get_base_by_public_id(db, TENDER_LIB_PUBLIC_ID)
+
+
 _ALLOWED_EXT = {
     ".doc",
     ".docx",
@@ -142,6 +155,9 @@ async def ensure_library_base(
     *,
     created_by: int | None = None,
 ) -> KnowledgeBase:
+    selected = current_company_base()
+    if selected is not None:
+        return selected
     result = await db.execute(
         select(KnowledgeBase).where(KnowledgeBase.public_id == TENDER_LIB_PUBLIC_ID)
     )
@@ -172,9 +188,13 @@ async def ensure_library_base(
 
 
 async def _list_docs(db: AsyncSession, base_id: int) -> list[KnowledgeDocument]:
-    result = await db.execute(
-        select(KnowledgeDocument).where(KnowledgeDocument.base_id == base_id)
-    )
+    stmt = select(KnowledgeDocument).where(KnowledgeDocument.base_id == base_id)
+    selected = current_company_base()
+    if selected is not None and selected.id == base_id:
+        stmt = stmt.where(
+            KnowledgeDocument.review_status == "approved", KnowledgeDocument.status != "deleted"
+        )
+    result = await db.execute(stmt)
     return list(result.scalars().all())
 
 
@@ -558,10 +578,10 @@ def _file_entry(doc: KnowledgeDocument, path: Path) -> dict[str, object]:
     return payload
 
 
-def _overlay_id_cards(pairs, files) -> None:
+def _overlay_id_cards(pairs, files, *, base_public_id=None) -> None:
     """摘要被 OCR 盖掉后，仍按正文把正反面配回同一个人。"""
     by_id = {}
-    for row in _library_card_metas(pairs):
+    for row in _library_card_metas(pairs, base_public_id=base_public_id):
         fid = str(row.get("fileId") or "")
         if fid and str(row.get("personKey") or "").strip():
             by_id[fid] = row
@@ -582,13 +602,18 @@ def _overlay_id_cards(pairs, files) -> None:
 def item_to_slot(
     parent: KnowledgeDocument,
     children: list[KnowledgeDocument],
+    *,
+    base_public_id: str | None = None,
 ) -> dict[str, object]:
+    selected = current_company_base()
+    if base_public_id is None and selected is not None:
+        base_public_id = selected.public_id
     key = key_from_tags(parent.tags) or f"m{parent.public_id}"
     pairs = _iter_file_docs(parent, children)
     files = [_file_entry(doc, path) for doc, path in pairs]
     if key == "id_legal":
-        _overlay_id_cards(pairs, files)
-    if not files and key and _KEY_RE.match(key):
+        _overlay_id_cards(pairs, files, base_public_id=base_public_id)
+    if base_public_id is None and not files and key and _KEY_RE.match(key):
         for path in list_slot_files(key):
             ext = path.suffix.lstrip(".").lower()
             files.append(
@@ -647,13 +672,14 @@ async def open_library_file(
     doc_public_id: str,
     *,
     thumb: bool = False,
+    base_public_id: str = TENDER_LIB_PUBLIC_ID,
 ) -> tuple[bytes, str, str]:
     """读取资料库扫描件。thumb=True 返回缩小 JPEG，便于列表缩略图。"""
     pid = (doc_public_id or "").strip()
     if not pid:
         raise AppError(ErrorCode.VALIDATION, "无效的文件 id", status_code=422)
     try:
-        base = await get_base_by_public_id(db, TENDER_LIB_PUBLIC_ID)
+        base = await get_base_by_public_id(db, base_public_id)
     except AppError as exc:
         raise AppError(ErrorCode.NOT_FOUND, "资料项不存在", status_code=404) from exc
     result = await db.execute(
@@ -718,7 +744,7 @@ async def catalog_placeholders(db: AsyncSession) -> list[PlaceholderItem]:
 
 async def dismissed_library_keys(db: AsyncSession) -> set[str]:
     result = await db.execute(select(TenderLibraryDismissal.key).where(
-        TenderLibraryDismissal.base_public_id == TENDER_LIB_PUBLIC_ID))
+        TenderLibraryDismissal.base_public_id == current_library_id()))
     return set(result.scalars().all())
 
 
@@ -872,21 +898,21 @@ async def _attach_facts_extract(db, doc, path: Path, *, key: str, title: str, hi
     doc.summary = dump_facts(bundle)
 
 
-def library_id_meta(doc):
+def library_id_meta(doc, *, base_public_id=None):
     """Read card facts from structured metadata or the already parsed original."""
     meta = load_id_meta(getattr(doc, 'summary', None))
     if meta is not None:
         return meta
     from api.services.knowledge.ingest import read_extracted_text
-    raw = read_extracted_text(TENDER_LIB_PUBLIC_ID, doc.public_id) or getattr(doc, 'summary', '') or ''
+    raw = read_extracted_text(base_public_id or current_library_id(), doc.public_id) or getattr(doc, 'summary', '') or ''
     card = parse_id_card_text(raw)
     return card if card.get('side') in {'front','back'} else None
 
 
-def _library_card_metas(files):
+def _library_card_metas(files, *, base_public_id=None):
     rows = []
     for doc, _path in sorted(files, key=lambda pair: getattr(pair[0], 'id', 0) or 0):
-        card = library_id_meta(doc)
+        card = library_id_meta(doc, base_public_id=base_public_id) if base_public_id else library_id_meta(doc)
         if not card:continue
         card = assign_person(card, rows)
         orphan = claim_orphan_back(card, rows)
@@ -911,7 +937,7 @@ async def legal_persons_from_library(
     files.sort(key=lambda pair: pair[0].id or 0)
     docs = [doc for doc, _path in files]
     dirty = False
-    if extract_missing:
+    if extract_missing and current_company_base() is None:
         for doc, path in files:
             if library_id_meta(doc) is not None:
                 continue
@@ -990,9 +1016,9 @@ async def performance_from_library(
     dirty = False
     skipped = 0
     for doc, path in _iter_file_docs(parent, children):
-        line = load_perf_meta(doc.summary)
+        line = _cached_performance(doc)
         if line is None:
-            if not extract_missing:
+            if not extract_missing or current_company_base() is not None:
                 skipped += 1
                 continue
             line = await _attach_perf_extract(db, doc, path)
@@ -1018,6 +1044,17 @@ async def performance_from_library(
             skipped,
         )
     return rank_performance_lines(lines)[:8]
+
+
+def _cached_performance(doc: KnowledgeDocument) -> PerformanceLine | None:
+    line = load_perf_meta(doc.summary)
+    if line is not None or current_company_base() is None:
+        return line
+    from api.services.knowledge.ingest import read_extracted_text
+    from api.services.tenders.performance import fallback_from_text
+
+    raw = read_extracted_text(current_library_id(), doc.public_id)
+    return fallback_from_text(raw, doc.name or "") if raw else None
 
 
 async def filter_performance_attachments(
@@ -1051,7 +1088,7 @@ async def filter_performance_attachments(
         doc = by_resolved.get(key)
         if doc is None:
             continue
-        line = load_perf_meta(doc.summary)
+        line = _cached_performance(doc)
         if line is None:
             continue
         if line_name_key(line.projectName) in names:
@@ -1092,7 +1129,7 @@ async def group_performance_attachments(
         doc = by_resolved.get(key)
         if doc is None:
             continue
-        line = load_perf_meta(doc.summary)
+        line = _cached_performance(doc)
         if line is None:
             continue
         nk = line_name_key(line.projectName)
@@ -1109,7 +1146,7 @@ async def count_uncached_performance_files(db: AsyncSession) -> int:
         return 0
     n = 0
     for doc, _path in _iter_file_docs(parent, children):
-        if load_perf_meta(doc.summary) is None:
+        if _cached_performance(doc) is None:
             n += 1
     return n
 
@@ -1211,7 +1248,7 @@ async def resolve_attachments(
     slots: list[PlaceholderItem],
 ) -> dict[str, list[Path]]:
     try:
-        base = await get_base_by_public_id(db, TENDER_LIB_PUBLIC_ID)
+        base = await read_library_base(db)
         docs = await _list_docs(db, base.id)
     except AppError:
         docs = []
@@ -1292,7 +1329,7 @@ async def resolve_attachments(
                         if path:
                             paths.append(path)
                             methods[key] = '标题别名'
-        if not paths and _KEY_RE.match(key) and not groups:
+        if not paths and current_company_base() is None and _KEY_RE.match(key) and not groups:
             paths = list_slot_files(key)
             requested_sources = material_sources(item.title + ' ' + item.hint)
             if requested_sources:

@@ -51,7 +51,7 @@ from api.services.knowledge.qdrant_store import get_qdrant_store
 from common.config import get_settings
 from common.errors import AppError, ErrorCode
 from common.times import to_epoch_ms
-from db.models.knowledge import KnowledgeDocument
+from db.models.knowledge import KnowledgeBase, KnowledgeDocument
 from db.session import AsyncSessionLocal
 
 logger = logging.getLogger("api.kb.ingest")
@@ -1290,7 +1290,9 @@ async def search_chunks(
     min_score: float = 0.0,
     kb_id: str | None = None,
     kb_ids: list[str] | None = None,
+    company_scoped: bool = False,
 ) -> list[dict[str, Any]]:
+    from api.services.knowledge.access import is_company_tender_library_id
     from api.services.knowledge.rerank import (
         compact_search_query,
         extract_lookup_needles,
@@ -1304,6 +1306,15 @@ async def search_chunks(
     q = compact_search_query(query)
     if not q:
         raise AppError(ErrorCode.VALIDATION, "query is required", status_code=422)
+
+    requested_ids = list(filter(None, kb_ids or [])) or ([kb_id] if kb_id else [])
+    company_ids = [pid for pid in requested_ids if is_company_tender_library_id(pid)]
+    if company_ids and not company_scoped:
+        kb_id = None
+        kb_ids = [pid for pid in requested_ids if not is_company_tender_library_id(pid)]
+        if not kb_ids:
+            return []
+        company_ids = []
 
     settings = get_settings()
     embedder = await get_embedding_client(db)
@@ -1334,7 +1345,7 @@ async def search_chunks(
             if prev is None or float(item.get("score") or 0) > float(prev.get("score") or 0):
                 merged[key] = item
         hits = list(merged.values())
-    hits = await _filter_approved_hits(db, hits)
+    hits = await _filter_approved_hits(db, hits, company_ids=company_ids)
     ranked = hybrid_rerank(
         q,
         hits,
@@ -1357,6 +1368,7 @@ async def search_chunks(
         except Exception as exc:  # noqa: BLE001
             logger.warning("neighbor expand failed: %s", exc)
             neighbors = []
+        neighbors = await _filter_approved_hits(db, neighbors, company_ids=company_ids)
         merged_neighbors: dict[tuple[str, int], dict[str, Any]] = {}
         for item in [*ranked, *neighbors]:
             key = (str(item.get("doc_id") or ""), int(item.get("chunk_index") or 0))
@@ -1372,17 +1384,23 @@ async def search_chunks(
 
 
 async def _filter_approved_hits(
-    db: AsyncSession, hits: list[dict[str, Any]]
+    db: AsyncSession, hits: list[dict[str, Any]], *, company_ids: list[str] | None = None
 ) -> list[dict[str, Any]]:
+    from api.services.knowledge.access import COMPANY_TENDER_LIB_PREFIX
+
     ids = [str(h.get("doc_id") or "").strip() for h in hits]
     ids = [x for x in ids if x]
     if not ids:
         return hits
     result = await db.execute(
-        select(KnowledgeDocument.public_id, KnowledgeDocument.tags).where(
+        select(KnowledgeDocument.public_id, KnowledgeDocument.tags).join(
+            KnowledgeBase, KnowledgeDocument.base_id == KnowledgeBase.id
+        ).where(
             KnowledgeDocument.public_id.in_(ids),
             KnowledgeDocument.status == "ready",
             KnowledgeDocument.review_status == "approved",
+            (~KnowledgeBase.public_id.startswith(COMPANY_TENDER_LIB_PREFIX))
+            | ((KnowledgeBase.status == "active") & KnowledgeBase.public_id.in_(company_ids or [])),
         )
     )
     allowed = {

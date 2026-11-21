@@ -49,9 +49,9 @@ async def generation_expiry_warnings(db, report, media):
     """Use resolved file identities, without resolving or modifying matches again."""
     try:
         from api.services.tenders.library_kb import (
-            TENDER_LIB_PUBLIC_ID, get_base_by_public_id, _list_docs, _doc_file_path,
+            _list_docs, _doc_file_path, read_library_base,
         )
-        base = await get_base_by_public_id(db, TENDER_LIB_PUBLIC_ID)
+        base = await read_library_base(db)
         docs = await _list_docs(db, base.id)
         documents = [(doc, path) for doc in docs if (path := _doc_file_path(doc))]
         return collect_expiry_warnings(report, media, documents)

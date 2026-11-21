@@ -39,6 +39,10 @@ def slot_dir(key: str) -> Path:
 
 
 def list_slot_files(key: str) -> list[Path]:
+    from api.services.tenders.library_scope import current_company_base
+
+    if current_company_base() is not None:
+        return []
     folder = slot_dir(key)
     files = [
         p

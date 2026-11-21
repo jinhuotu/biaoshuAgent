@@ -6,7 +6,7 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from api.services.knowledge.access import TENDER_LIB_PUBLIC_ID
+from api.services.knowledge.access import is_company_tender_library_id, is_tender_library_id
 from api.services.knowledge.rerank import tender_hit_matches_query
 from api.services.tenders.library_kb import open_library_file
 from common.errors import AppError
@@ -37,7 +37,7 @@ def unique_tender_docs(
     out: list[dict[str, Any]] = []
     q = (query or "").strip()
     for row in chunks:
-        if _kb_id(row) != TENDER_LIB_PUBLIC_ID:
+        if not is_tender_library_id(_kb_id(row)):
             continue
         pid = str(row.get("doc_id") or "").strip()
         if not pid or pid in seen:
@@ -71,7 +71,13 @@ async def load_tender_original_blobs(
             continue
         pid = str(row.get("doc_id") or "").strip()
         try:
-            data, _name, media = await open_library_file(db, pid, thumb=True)
+            base_id = _kb_id(row)
+            if is_company_tender_library_id(base_id):
+                data, _name, media = await open_library_file(
+                    db, pid, thumb=True, base_public_id=base_id
+                )
+            else:
+                data, _name, media = await open_library_file(db, pid, thumb=True)
         except AppError:
             continue
         mime = (media or "image/jpeg").split(";", 1)[0].strip() or "image/jpeg"

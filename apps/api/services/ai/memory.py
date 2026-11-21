@@ -388,13 +388,16 @@ async def bump_session_meta(
     session: ChatSession,
     mode: str | None = None,
     knowledge_base_ids: list[str] | None = None,
+    automatic_knowledge: bool = False,
 ) -> None:
     """轻量更新会话元数据（非消息正文），便于侧栏排序。"""
     session.message_count = int(session.message_count or 0) + 1
     session.last_message_at = datetime.now(timezone.utc)
     if mode in ("fast", "deep"):
         session.mode = mode
-    if knowledge_base_ids is not None:
+    if automatic_knowledge:
+        session.knowledge_base_ids = None
+    elif knowledge_base_ids is not None:
         session.knowledge_base_ids = [str(x) for x in knowledge_base_ids if x][:32]
     await db.commit()
     await db.refresh(session)

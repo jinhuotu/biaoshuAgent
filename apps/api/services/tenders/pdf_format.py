@@ -997,7 +997,7 @@ def format_paste_source(invitation_id: str) -> str:
     return "\n".join(lines)
 
 
-def unify_full_docx(path: Path, brief, *, link_toc: bool = True) -> None:
+def unify_full_docx(path: Path, brief, *, link_toc: bool = True, preserve_headings: bool = False) -> None:
     """完整标填完商务、技术正文后，共用目录书签和连续页码。"""
     from api.services.tenders.categories import is_volume_label
     from api.services.tenders.document import _ensure_header
@@ -1010,7 +1010,7 @@ def unify_full_docx(path: Path, brief, *, link_toc: bool = True) -> None:
 
     native = is_format_start(getattr(brief, 'outlineChapter', ''))
     if native:
-        ensure_toc_rows(doc, brief, volume="full")
+        ensure_toc_rows(doc, brief, volume="full", preserve_headings=preserve_headings)
     in_front = True
     cover_named = False
     for para in list(doc.paragraphs):
@@ -1117,7 +1117,7 @@ def assemble_from_word_format(
         # Preserve the source chapter set: never append absent catalog modules.
         normalize_bookmarks(doc)
         if not tech_front:
-            ensure_toc_rows(doc, brief, volume=vol)
+            ensure_toc_rows(doc, brief, volume=vol, preserve_headings=True)
     if kind == "pdf":
         _pull_pdf_blank_lines(doc)
     from api.services.tenders.company_identity import guard_document_subjects
@@ -1153,7 +1153,7 @@ def assemble_from_word_format(
         from api.services.tenders.format_rules import apply_volume_format
 
         spec = fmt.technicalFormat if vol == "technical" else fmt.businessFormat
-        slice_notes.extend(apply_volume_format(doc, spec))
+        slice_notes.extend(apply_volume_format(doc, spec, preserve_headings=True))
     _restart_page_after_toc(doc)
     from api.services.tenders.placeholders import place_unmatched_slots
 
@@ -1726,10 +1726,13 @@ def _install_tech_front(doc: Document, brief, *, anon: bool, cover_nodes: list |
         for i, (_el, level, title, source) in enumerate(heads)
     ])
     bookmarks = _subset_bookmarks(doc, items)
+    from api.services.tenders.word_structure import outline_level
+
     for (el, _level, _title, _source), item, bookmark in zip(heads, items, bookmarks, strict=True):
         if el is None:
             continue
-        _mark_outline(el, item.level)
+        if not outline_level(doc, el):
+            _mark_outline(el, item.level)
         _bookmark_paragraph(Paragraph(el, doc), bookmark)
     old = set(doc.element.body)
     fmt = brief.documentFormat or DocumentFormat()

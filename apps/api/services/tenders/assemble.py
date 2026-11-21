@@ -571,13 +571,16 @@ def assemble_bid_docx(
     quote_notes.extend(material_notes)
     warnings.extend(material_notes)
 
-    def finish(path: Path, notes: list[str]) -> tuple[Path, list[str]]:
+    def finish(path: Path, notes: list[str], *, preserve_headings: bool = False) -> tuple[Path, list[str]]:
         out = list(dict.fromkeys([*quote_notes, *(notes or [])]))
         if render_package:
             from api.services.tenders.technical_render import render
 
             document = Document(path)
-            out.extend(render(document, named.model_copy(update={'technicalPackage':brief.technicalPackage})))
+            out.extend(render(
+                document, named.model_copy(update={'technicalPackage': brief.technicalPackage}),
+                preserve_headings=preserve_headings,
+            ))
             document.save(path)
         if brief.materialDemands:
             from api.services.tenders.material_intents import enforce_material_outcomes
@@ -596,13 +599,16 @@ def assemble_bid_docx(
         if vol == "full":
             from api.services.tenders.pdf_format import unify_full_docx
 
-            unify_full_docx(path, brief, link_toc=(brief.layoutMode or "").strip() == "outline")
+            unify_full_docx(
+                path, brief, link_toc=(brief.layoutMode or "").strip() == "outline",
+                preserve_headings=preserve_headings,
+            )
         elif native:
             from api.services.tenders.native_format import drop_legacy_toc_bookmarks, ensure_toc_rows
 
             document = Document(path)
             drop_legacy_toc_bookmarks(document)
-            ensure_toc_rows(document, brief, volume=vol)
+            ensure_toc_rows(document, brief, volume=vol, preserve_headings=preserve_headings)
             document.save(path)
             out = [note for note in out if '目录未定位条目' not in note]
         if brief.requirementsDriven:
@@ -620,7 +626,10 @@ def assemble_bid_docx(
         if vol == 'technical':
             spec = page_format.technicalFormat
             page_format = DocumentFormat(pageNumberStart=spec.pageNumberStart if spec.pageStartSet else 'body')
-        out.extend(finalize(document, brief, page_format, facts=catalog_facts, slots=catalog_slots, media=catalog_media, layout=False))
+        out.extend(finalize(
+            document, brief, page_format, facts=catalog_facts, slots=catalog_slots,
+            media=catalog_media, layout=False, preserve_headings=preserve_headings,
+        ))
         document.save(path)
         if removed:
             out.append(f"Removed {removed} repeated child modules already present in the source section")
@@ -643,14 +652,21 @@ def assemble_bid_docx(
                 json.dumps({vol: qa_row}, ensure_ascii=False, indent=2), encoding='utf-8'
             )
         document = Document(path)
-        normalize_document_colors(document)
+        normalize_document_colors(document, preserve_headings=preserve_headings)
         if not defer_layout:
             from api.services.tenders.document import finalize_body_layout
-            finalize_body_layout(document, brief.documentFormat)
+            finalize_body_layout(document, brief.documentFormat, preserve_headings=preserve_headings)
             out.extend(getattr(document.element, "_layout_notes", []))
         out.extend(f"目录待确认（缺少来源标题）：{item.id}"
                    for item in brief.outlineItems
                    if not item.skipped and item.tocEligible is not False and not _toc_source_title(item))
+        if preserve_headings:
+            object.__setattr__(named, '_heading_style_report', {
+                'source': 'original', 'changes': 0, 'violations': 0,
+            })
+            document.save(path)
+            return path, out
+
         from api.services.tenders.heading_style import (
             resolve_heading_points, apply_heading_styles, normalize_heading_paragraphs,
         )
@@ -714,7 +730,7 @@ def assemble_bid_docx(
                 if inserted:
                     hit[1].append(f"已在格式章既有章节填入 {inserted} 处商务响应")
                 hit[1].extend(missing)
-            return finish(*hit)
+            return finish(*hit, preserve_headings=True)
         # 上传过招标书却没截出 docx-raw：直接失败，不写说明稿，也不改用固定模板
         if (brief.invitationId or "").strip():
             from common.errors import AppError, ErrorCode
@@ -1476,7 +1492,7 @@ def _freeze_render_directory(doc: Document) -> None:
                             part.getparent().remove(part)
 
 
-def finalize_word_layout(path: Path, volume: str, fmt=None) -> list[str]:
+def finalize_word_layout(path: Path, volume: str, fmt=None, *, preserve_headings: bool = False) -> list[str]:
     """Finalize the cover and replace provisional TOC caches on the delivered DOCX."""
     from docx.text.paragraph import Paragraph
     from api.services.tenders.document import _pageref_bookmark, _set_pageref_cache
@@ -1484,7 +1500,7 @@ def finalize_word_layout(path: Path, volume: str, fmt=None) -> list[str]:
 
     doc = Document(path)
     from api.services.tenders.document import finalize_body_layout
-    changed = finalize_body_layout(doc, fmt)
+    changed = finalize_body_layout(doc, fmt, preserve_headings=preserve_headings)
     warnings = list(getattr(doc.element, "_layout_notes", []))
     entries = []
     for node in doc.element.body.iter(qn("w:p")):
@@ -1802,6 +1818,7 @@ def _write_toc(
     if technical_projection:
         profile = build_style_profile(doc)
         probe_profile = replace(profile, head_max=0)
+        probe_document = Document()
         selected: list[tuple[OutlineItem, str]] = []
         for item, bookmark in zip(items, bookmarks, strict=True):
             title = _toc_source_title(item)
@@ -1813,7 +1830,7 @@ def _write_toc(
                 else "Heading 2" if item_level == 2
                 else "Heading 9"
             )
-            probe = doc.add_paragraph(title, style=style)
+            probe = probe_document.add_paragraph(title, style=style)
             role = classify_paragraph(probe, probe_profile)
             probe._element.getparent().remove(probe._element)
             if role.role not in {"chapter", "item"}:

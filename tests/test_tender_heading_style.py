@@ -1,14 +1,20 @@
+import pytest
 from docx import Document
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
-from docx.shared import Pt
+from docx.shared import Pt, RGBColor
 
+from api.services.tenders.assemble import _write_toc
+from api.services.tenders.document import finalize_body_layout
+from api.services.tenders.generate import generate_bid
 from api.services.tenders.heading_style import (
     apply_heading_styles,
     normalize_heading_paragraphs,
     resolve_heading_points,
 )
+from api.services.tenders.schema import BidBrief, DocumentFormat, OutlineItem, VolumeFormat
+from api.services.tenders.technical_render import render
 
 POINTS = {'level1': (16.0, '宋体'), 'level2': (14.0, '宋体'), 'source': 'fallback'}
 
@@ -125,3 +131,116 @@ def test_inherited_cover_size_is_preserved_without_run_sizes_and_is_idempotent()
     apply_heading_styles(document, POINTS)
     assert normalize_heading_paragraphs(document, POINTS) == {}
     assert (document.element.xml, document.styles.element.xml) == once
+
+
+@pytest.mark.parametrize('heading_name', ['heading 1', 'Heading 1'])
+def test_generate_from_word_preserves_original_heading_format(tmp_path, monkeypatch, heading_name):
+    source = Document()
+    style = source.styles['Heading 1']
+    style.font.name = '楷体'
+    style.font.size = Pt(27)
+    style.font.color.rgb = RGBColor.from_string('294B83')
+    source.styles['Heading 2'].delete()
+
+    title = '货物交付及售后服务能力总体说明'
+    heading = source.add_paragraph(title, style)
+    heading.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    heading.paragraph_format.left_indent = Pt(12)
+    heading.paragraph_format.tab_stops.add_tab_stop(Pt(48))
+    heading.paragraph_format.space_before = Pt(9)
+    heading._p.pPr.get_or_add_numPr().get_or_add_numId().val = 5
+    run = heading.runs[0]
+    run.font.name = '黑体'
+    run.font.size = Pt(23)
+    run.font.color.rgb = RGBColor.from_string('782458')
+    run.bold = True
+    style.element.find(qn('w:name')).set(qn('w:val'), heading_name)
+
+    body_text = '本项目各项服务将按招标文件的约定执行。'
+    source.add_paragraph(body_text)
+    source_path = tmp_path / 'source.format.docx'
+    source.save(source_path)
+    source_path.with_suffix('.docx.source').write_text('docx-raw', encoding='utf-8')
+    original_bytes = source_path.read_bytes()
+    monkeypatch.setattr('api.services.tenders.pdf_format._word_format_file', lambda _: source_path)
+    monkeypatch.setattr('api.services.tenders.generate.tenders_output_dir', lambda: tmp_path)
+
+    brief = BidBrief(
+        layoutMode='outline', invitationId='abc123def456', generateVolume='business',
+        documentFormat=DocumentFormat(businessFormat=VolumeFormat(
+            fontSet=True, fontName='宋体', bodySizeSet=True, bodySizePt=12,
+        )),
+    )
+    result = generate_bid(brief, catalog_slots=[], catalog_media={}, catalog_facts=[])
+    output = Document(tmp_path / result['docxFile'])
+    generated = next(p for p in output.paragraphs if p.text == title)
+
+    assert generated.style.style_id == 'Heading1'
+    assert generated.style.element.xml == style.element.xml
+    # TOC pagination may add a page break before the first body heading.
+    for name in ('pStyle', 'jc', 'ind', 'tabs', 'spacing', 'numPr', 'outlineLvl'):
+        expected = heading._p.pPr.find(qn(f'w:{name}'))
+        actual = generated._p.pPr.find(qn(f'w:{name}'))
+        if expected is None:
+            assert actual is None
+        else:
+            assert actual.xml == expected.xml
+    assert generated.runs[0]._r.rPr.xml == run._r.rPr.xml
+    assert output.part.numbering_part.element.xml == source.part.numbering_part.element.xml
+    assert next(p for p in output.paragraphs if p.text == body_text).runs[0].font.size.pt == 12
+    assert result['headingStyleReport']['source'] == 'original'
+    assert source_path.read_bytes() == original_bytes
+
+
+def test_technical_toc_does_not_require_standard_heading_style_names():
+    document = Document()
+    style = document.styles['Heading 1']
+    style.element.find(qn('w:name')).set(qn('w:val'), 'Heading 1')
+    document.styles['Heading 2'].delete()
+    title = '施工组织设计'
+    original = document.add_paragraph(title, style)
+    original_xml = original._p.xml
+    brief = BidBrief(generateVolume='technical', layoutMode='outline')
+    items = [OutlineItem(id='design', title=title, rawTitle=title, kind='tech_chapter')]
+
+    _write_toc(document, items, brief, brief.documentFormat, ['toc_design'], subset=True)
+
+    assert original._p.xml == original_xml
+    assert sum(title in p.text for p in document.paragraphs) == 2
+
+
+def test_technical_content_respects_numbering_and_typography_of_source_heading():
+    document = Document()
+    title = '质量保障措施'
+    heading = document.add_paragraph(title, 'Heading 2')
+    heading.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    heading.paragraph_format.left_indent = Pt(18)
+    heading._p.pPr.get_or_add_numPr().get_or_add_numId().val = 5
+    heading.runs[0].font.size = Pt(20)
+    original_paragraph_format = heading._p.pPr.xml
+    original_run_format = heading.runs[0]._r.rPr.xml
+    text = '验收前核对批次资料与实物标识，逐项记录核验结果。'
+    brief = BidBrief(technicalPackage={
+        'sections': [{'id': 'quality', 'title': title, 'body': text}],
+        'tables': [], 'figures': [],
+    })
+
+    render(document, brief, preserve_headings=True)
+
+    assert heading.text == title
+    assert heading._p.pPr.xml == original_paragraph_format
+    assert heading.runs[0]._r.rPr.xml == original_run_format
+    assert document.paragraphs[1].text == text
+
+
+def test_source_heading_style_keeps_its_indent_in_a_signoff_block():
+    document = Document()
+    signing = document.add_paragraph('投标人（加盖公章）：', 'Heading 6')
+    date = document.add_paragraph('日期：2026年11月21日')
+    date.paragraph_format.left_indent = Pt(57.7)
+    original = signing._p.pPr.xml
+
+    finalize_body_layout(document, preserve_headings=True)
+
+    assert signing._p.pPr.xml == original
+    assert date.paragraph_format.left_indent == Pt(57.7)

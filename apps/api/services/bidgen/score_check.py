@@ -226,7 +226,10 @@ def run_score_check(
         placeholders = sum(1 for s in sections for n in s.walk() for b in n.blocks if b["type"] == "placeholder")
         written = [s for s in sections if not headings or re.sub(r"\s+", "", s.heading) in headings]
         estimated, basis, advice = (None, "", [])
-        if deduction:
+        source_path = criterion.get("source_path", "")
+        if source_path and not external:
+            basis = "按评分附件原文结合证明材料人工核验"
+        elif deduction:
             clean = profile["declarations"]["noAdverseRecord"]
             estimated, basis = (0.0, "已出具诚信自查声明：不存在所列扣分情形") if clean else (None, "未声明无不良记录，需逐项核实")
         elif not external:
@@ -234,7 +237,8 @@ def run_score_check(
         advice = list(advice)
         if external:
             status = STATUS_EXTERNAL
-            basis = basis or "该项由招标人依据供应商绩效评价 / 历史履约数据评定，投标文件无需单独响应"
+            basis = basis or ("由招标人按评分附件评定，补充资料按该项细则核对" if source_path
+                              else "该项由招标人依据供应商绩效评价 / 历史履约数据评定，投标文件无需单独响应")
         elif not written:
             status = STATUS_MISSING
             advice.insert(0, "生成稿中没有该评分项的响应章节")
@@ -259,6 +263,7 @@ def run_score_check(
                 "minScore": criterion["min_score"],
                 "maxScore": criterion["max_score"],
                 "rule": criterion["rule"],
+                "sourcePath": source_path,
                 "deduction": deduction,
                 "status": status,
                 "statusLabel": STATUS_LABELS[status],
@@ -276,6 +281,7 @@ def run_score_check(
         if not scoped:
             continue
         scorable = [i for i in scoped if not i["deduction"] and i["status"] != STATUS_EXTERNAL]
+        estimates = [i["estimatedScore"] for i in scorable if i["estimatedScore"] is not None]
         volumes.append(
             {
                 "volume": volume,
@@ -283,8 +289,9 @@ def run_score_check(
                 "total": len(scoped),
                 "counts": {status: sum(1 for i in scoped if i["status"] == status) for status in STATUS_LABELS},
                 "maxScore": sum(i["maxScore"] or 0 for i in scorable),
-                "estimatedScore": sum(i["estimatedScore"] or 0 for i in scorable if i["estimatedScore"] is not None),
-                "unestimated": sum(1 for i in scorable if i["estimatedScore"] is None),
+                "estimatedScore": sum(estimates),
+                "estimatedCount": len(estimates),
+                "unestimated": len(scorable) - len(estimates),
                 "externalMaxScore": sum(i["maxScore"] or 0 for i in scoped if i["status"] == STATUS_EXTERNAL),
             }
         )
@@ -295,6 +302,7 @@ def run_score_check(
         "volumes": volumes,
         "coverage": round(100 * responded / len(items), 1) if items else 0,
         "expiredCertificates": expired,
-        "readBack": bool(headings),
-        "passed": all(i["status"] != STATUS_MISSING for i in items),
+        "available": bool(items),
+        "readBack": bool(items and headings),
+        "passed": bool(items) and all(i["status"] != STATUS_MISSING for i in items),
     }

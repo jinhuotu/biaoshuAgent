@@ -69,8 +69,8 @@ def _child_heading_style(doc, parent):
     for style in doc.styles:
         name = (style.name or "").lower()
         if name in {"heading 2", "标题 2", "heading2", "标题2"}:
-            return style.name
-    return parent.style.name
+            return style
+    return parent.style
 
 
 def _package_display_titles(package):
@@ -509,7 +509,7 @@ def _diagram(package,kind,brief):
     stream=BytesIO();image.save(stream,format='PNG');stream.seek(0);return stream
 
 
-def render(doc,brief):
+def render(doc, brief, *, preserve_headings=False):
     from api.services.tenders.document import _bookmark_paragraph
     from api.services.tenders.pdf_format import _word_format_file
     from docx import Document
@@ -566,7 +566,7 @@ def render(doc,brief):
             raise AppError(ErrorCode.VALIDATION,'技术明标正文出现其他投标人身份，请核对后重新起草',status_code=422)
     markers={m.get(qn('w:name')) for m in doc.element.iter(qn('w:bookmarkStart'))}
     paragraphs=list(doc.paragraphs)
-    source_path=_word_format_file(brief.invitationId)
+    source_path = None if preserve_headings else _word_format_file(brief.invitationId)
     source=Document(source_path) if source_path else None
     source_props={key(p.text):p._p.pPr for p in source.paragraphs} if source is not None else {}
     if package.get('template_kind') == 'chapter_heading':
@@ -595,8 +595,9 @@ def render(doc,brief):
             head=chapter_nodes.get(_title_key(chapter['title']))
             if head is None:
                 raise ValueError('技术评分章未找到落位：'+chapter['title'])
-            head.style = 'Heading 1'
-            _replace_paragraph_text(head, strip_title_tail(_clean(chapter_titles[chapter['title']], brief)))
+            if not preserve_headings:
+                head.style = 'Heading 1'
+                _replace_paragraph_text(head, strip_title_tail(_clean(chapter_titles[chapter['title']], brief)))
             _bookmark_paragraph(head, f'toc_technical_chapter_{chapter_index}')
             cursor=head._p
             display_title = chapter_titles.get(chapter['title'], chapter['title'])
@@ -684,23 +685,24 @@ def render(doc,brief):
         heading=next((p for p in paragraphs if _title_key(p.text)==_title_key(point['title']) and 'PAGEREF' not in p._p.xml),None)
         if heading is None:
             raise ValueError('技术要点未找到原版落位：'+point['title'])
-        original_text = heading.text
-        original_num = heading._p.pPr.find(qn('w:numPr')) if heading._p.pPr is not None else None
-        original_num = deepcopy(original_num) if original_num is not None else None
-        _replace_paragraph_text(heading, strip_title_tail(point_titles.get(point.get('id'), point['title'])))
-        if key(point['title']) in source_props:
-            current=heading._p.pPr
-            original=source_props[key(point['title'])]
-            signature=lambda p:None if p is None else [(n.tag,sorted(n.attrib.items())) for n in p.iter()]
-            if signature(current)!=signature(original):
-                if current is not None:heading._p.remove(current)
-                if original is not None:heading._p.insert(0,deepcopy(original))
-        if original_num is not None:
-            props = heading._p.get_or_add_pPr()
-            for numbered in list(props.findall(qn('w:numPr'))):
-                props.remove(numbered)
-            props.append(original_num)
-        upgrade_section(heading, original_text, point_index)
+        if not preserve_headings:
+            original_text = heading.text
+            original_num = heading._p.pPr.find(qn('w:numPr')) if heading._p.pPr is not None else None
+            original_num = deepcopy(original_num) if original_num is not None else None
+            _replace_paragraph_text(heading, strip_title_tail(point_titles.get(point.get('id'), point['title'])))
+            if key(point['title']) in source_props:
+                current=heading._p.pPr
+                original=source_props[key(point['title'])]
+                signature=lambda p:None if p is None else [(n.tag,sorted(n.attrib.items())) for n in p.iter()]
+                if signature(current)!=signature(original):
+                    if current is not None:heading._p.remove(current)
+                    if original is not None:heading._p.insert(0,deepcopy(original))
+            if original_num is not None:
+                props = heading._p.get_or_add_pPr()
+                for numbered in list(props.findall(qn('w:numPr'))):
+                    props.remove(numbered)
+                props.append(original_num)
+            upgrade_section(heading, original_text, point_index)
         if head_marker not in markers:_bookmark_paragraph(heading,head_marker)
         if marker in markers:continue
         end=_after(doc,heading._p,point['body'],brief)

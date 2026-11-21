@@ -13,7 +13,7 @@ from pathlib import Path
 from api.services.bidgen.archive import ARCHIVE_SUFFIXES, ArchiveEntry, flatten_entries
 from api.services.bidgen.docx_reader import DocBlock, blocks_to_text, read_docx_blocks, template_paragraph
 from api.services.bidgen.pdf_reader import read_pdf_blocks
-from api.services.bidgen.integrated_parser import is_integrated_document, parse_integrated_document
+from api.services.bidgen.integrated_parser import format_chapter_bodies, is_integrated_document, parse_integrated_document
 from api.services.bidgen.project_facts import extract_project_facts
 
 ROLE_INVITATION = "invitation"
@@ -22,6 +22,7 @@ ROLE_TECH_SPEC = "tech_spec"
 ROLE_CONTRACT = "contract"
 ROLE_SIGNATURE = "signature"
 ROLE_ARCHIVE = "archive"
+ROLE_SCORING = "scoring"
 ROLE_OTHER = "other"
 
 ROLE_LABELS = {
@@ -31,14 +32,27 @@ ROLE_LABELS = {
     ROLE_CONTRACT: "合同文件",
     ROLE_SIGNATURE: "签名校验文件",
     ROLE_ARCHIVE: "压缩包",
+    ROLE_SCORING: "评分标准附件",
     ROLE_OTHER: "其他文件",
 }
 
 _SCORE_RANGE = re.compile(r"[（(]\s*(-?\d+(?:\.\d+)?)\s*[-~－—–]\s*(-?\d+(?:\.\d+)?)\s*分?\s*[)）]")
-_SCORE_TIER = re.compile(r"【\s*(扣)?\s*(-?\d+(?:\.\d+)?)(?:\s*[-~]\s*(\d+(?:\.\d+)?))?\s*】?\s*分?\s*】?")
+_SCORE_NUMBER = r"-?\d+(?:\.\d+)?"
+_SCORE_TIER = re.compile(
+    rf"【\s*(?:(?P<zero>[^【】]*?不扣分)|(?P<deduct>扣)?\s*(?P<first>{_SCORE_NUMBER})"
+    rf"(?:\s*[-~～－—–]\s*(?P<last>{_SCORE_NUMBER}))?\s*分?)\s*】(?:\s*分)?"
+)
+_SCORE_ATTACHMENT = re.compile(r"^(?P<label>.*?)(?P<volume>商务|技术)评分标准$")
+_CATEGORY_WEIGHTS_HEADER = ("物资类别", "权重比例（技：商：价）")
 _FIXED_ID = re.compile(r"(\d{4}-\d{9}-\d{5})")
 _CHAPTER_HEADING = re.compile(r"^第[一二三四五六七八九十]+章")
 _VOLUME_TITLES = ("价格文件", "商务文件", "技术文件")
+_PLATFORM_VOLUMES = (*_VOLUME_TITLES, "资质业绩文件")
+_PLATFORM_DIRECTORY_HEADER = (
+    "序号", "内容", "电子商务平台", "招投标智能服务平台", "是否有格式要求", "电子商务平台离线投标工具上传端口",
+)
+_PLATFORM_TEMPLATE_HEADING = re.compile(r"^(?:[（(][一二三四五六七八九十\d]+[）)]|\d+[.．、]|附表\s*\d+)")
+_PLATFORM_PATH_NOTE = re.compile(r"[（(](?:在投标工具|可在投标工具|投标工具路径|上传投标工具路径)")
 
 
 @dataclass
@@ -70,6 +84,7 @@ class ScoreCriterion:
     max_score: float | None
     rule: str
     tiers: list[dict] = field(default_factory=list)
+    source_path: str = ""
 
 
 @dataclass
@@ -86,6 +101,7 @@ class FormatItem:
     not_applicable: bool = False
     children_required: bool = False
     template: list[dict] = field(default_factory=list)  # 第六章正文里给出的格式原文
+    submission_mode: str = ""
 
 
 @dataclass
@@ -127,10 +143,12 @@ class TenderInfo:
     supplements: list[dict] = field(default_factory=list)
     key_clauses: list[dict] = field(default_factory=list)
     criteria: list[ScoreCriterion] = field(default_factory=list)
+    scoring_weights: dict[str, dict[str, int]] = field(default_factory=dict)
     format_items: list[FormatItem] = field(default_factory=list)
     # "integrated"：格式目录取自整本招标文件的格式章节，按原文顺序编排，不分商务 / 技术两卷
     format_layout: str = ""
-    format_source: str = ""  # "list"：目录来自须知中“商务标书 / 技术标书应包括下列内容”的清单，没有格式章节
+    format_source: str = ""  # "list"：须知中的组成清单；"platform"：格式章的电子商务平台目录
+    format_source_path: str = ""
     cover_title: str = ""  # 格式章节封面上的文件名称，如“谈判响应文件”“投标文件”
     project_facts: dict = field(default_factory=dict)  # 整本招标文件的项目事实，供技术标编写器使用
     tech_specs: list[TechSpec] = field(default_factory=list)
@@ -159,6 +177,8 @@ def classify_entry(entry: ArchiveEntry, blocks: list[DocBlock] | None) -> str:
         return ROLE_ARCHIVE
     if entry.suffix == ".sign":
         return ROLE_SIGNATURE
+    if _SCORE_ATTACHMENT.fullmatch(Path(entry.name).stem):
+        return ROLE_SCORING
     path_text = entry.logical_path
     head_text = blocks_to_text(blocks[:40]) if blocks else ""
     if "技术规范" in path_text or "技术参数特性表" in head_text or "技术规范专用部分" in head_text:
@@ -297,17 +317,29 @@ def _parse_range(text: str) -> tuple[str, float | None, float | None]:
 
 
 def _parse_tiers(rule: str) -> list[dict]:
-    """把“……得【5】分；其他得【2】分”拆成分档。"""
+    """保留规则里的每个显式档位及原文条件，区间不取单点。"""
     tiers: list[dict] = []
-    for clause in re.split(r"[；;。]\s*", rule):
-        matched = _SCORE_TIER.search(clause)
-        if not matched or not clause.strip():
-            continue
-        score = float(matched.group(3) or matched.group(2))
-        if matched.group(1):
-            score = -abs(score)
-        condition = _clean(_SCORE_TIER.sub("", clause)).strip("：:，,得分 ")
-        tiers.append({"score": score, "condition": condition})
+    for clause in re.split(r"[。\n]", rule):
+        end = 0
+        for matched in _SCORE_TIER.finditer(clause):
+            condition = _clean(clause[end:matched.start()]).strip("：:，,；; ")
+            condition = re.sub(r"\s*(?:得|计)$", "", condition)
+            end = matched.end()
+            if matched["zero"]:
+                in_marker = matched["zero"].removesuffix("不扣分").strip("，, ")
+                condition = "，".join(part for part in (condition, in_marker) if part)
+                tiers.append({"score": 0.0, "condition": condition})
+                continue
+            first = float(matched["first"])
+            if matched["deduct"]:
+                first = -abs(first)
+            if matched["last"] is None:
+                tiers.append({"score": first, "condition": condition})
+                continue
+            last = float(matched["last"])
+            if matched["deduct"]:
+                last = -abs(last)
+            tiers.append({"min_score": min(first, last), "max_score": max(first, last), "condition": condition})
     return tiers
 
 
@@ -394,6 +426,53 @@ def _parse_scoring(blocks: list[DocBlock], info: TenderInfo) -> None:
                 by_name[_clean(row[0])].award_rule = _clean(row[2])
 
 
+def _parse_category_weights(blocks: list[DocBlock], info: TenderInfo) -> None:
+    for block in blocks:
+        if block.kind != "table" or tuple(_clean(cell) for cell in block.rows[0]) != _CATEGORY_WEIGHTS_HEADER:
+            continue
+        for row in block.rows[1:]:
+            if len(row) != 2 or not row[0].strip():
+                continue
+            matched = re.fullmatch(r"\s*(\d+)\s*[:：]\s*(\d+)\s*[:：]\s*(\d+)\s*", row[1])
+            if matched:
+                technical, business, price = map(int, matched.groups())
+                info.scoring_weights.setdefault(_clean(row[0]), {"technical": technical, "business": business, "price": price})
+
+
+def _parse_scoring_attachments(
+    attachments: list[tuple[ArchiveEntry, list[DocBlock] | None]], info: TenderInfo,
+) -> None:
+    seen = {(c.volume, c.category, c.group, c.factor, c.rule) for c in info.criteria}
+    categories = set(info.scoring_weights) | {lot.scoring_category or lot.category for lot in info.lots}
+    for index, (entry, blocks) in enumerate(attachments, 1):
+        named = _SCORE_ATTACHMENT.fullmatch(Path(entry.name).stem)
+        if named is None:
+            continue
+        volume = "business" if named["volume"] == "商务" else "technical"
+        heading = _clean(named["label"]).removesuffix("物资品类").rstrip("-_ ")
+        category = max(
+            (name for name in categories if name and heading.endswith(name)), key=len, default="",
+        ) if volume == "technical" else ""
+        count = 0
+        for block in blocks or []:
+            if block.kind != "table":
+                continue
+            header = tuple(_clean(cell) for cell in block.rows[0])
+            if header not in {("项目", "评审要素", "评审细则"), ("项目", "评审要素", "评审内容")}:
+                continue
+            parsed = _criteria_from_table(block, volume, category, f"S{index}-{count + 1}")
+            count += len(parsed)
+            for criterion in parsed:
+                key = (criterion.volume, criterion.category, criterion.group, criterion.factor, criterion.rule)
+                if key in seen:
+                    continue
+                seen.add(key)
+                criterion.source_path = entry.logical_path
+                info.criteria.append(criterion)
+        if not count:
+            info.warnings.append(f"评分标准附件“{entry.logical_path}”未提取到评分表，请核对原件或另存为可编辑的 .docx 后重新上传。")
+
+
 def _parse_key_clauses(blocks: list[DocBlock], info: TenderInfo) -> None:
     table = _find_table(blocks, "条款号", "条款名称", "编列内容")
     if table is None:
@@ -414,20 +493,34 @@ def _parse_format_directory(blocks: list[DocBlock], info: TenderInfo) -> None:
     if table is None:
         info.warnings.append("未在招标文件中找到“投标文件格式目录”，将按通用货物类投标文件结构编排。")
         return
+    info.format_items = _format_directory_items(table)
+    _attach_format_templates(blocks, info)
+
+
+def _format_directory_items(table: DocBlock, *, platform: bool = False) -> list[FormatItem]:
+    items: list[FormatItem] = []
+    volumes = _PLATFORM_VOLUMES if platform else _VOLUME_TITLES
     volume = ""
     for row in table.rows[1:]:
         cells = [_clean(cell) for cell in row] + [""] * 6
         number, title = cells[0], cells[1]
         if not title or not number:
             continue
-        volume_title = next((v for v in _VOLUME_TITLES if title.startswith(v)), "")
+        volume_title = next((v for v in volumes if title.startswith(v)), "")
         if volume_title and re.fullmatch(r"[一二三四五六七八九十]+", number):
             volume = volume_title
             continue
         if not volume:
             continue
         ticks = [cell == "√" for cell in cells[2:5]]
-        info.format_items.append(
+        port = cells[5]
+        mode = ""
+        if platform:
+            if "自动生成" in port:
+                mode = "tool_generated"
+            elif "无偏差" in port:
+                mode = "conditional_deviation"
+        items.append(
             FormatItem(
                 number=number,
                 title=title,
@@ -435,10 +528,11 @@ def _parse_format_directory(blocks: list[DocBlock], info: TenderInfo) -> None:
                 level=number.count(".") + 1 if re.match(r"\d", number) else 1,
                 required=ticks[0] or ticks[1],
                 has_format=ticks[2],
-                port=cells[5],
+                port=port,
+                not_applicable=platform and cells[2:4] == ["×", "×"],
+                submission_mode=mode,
             )
         )
-    items = info.format_items
     for index, item in enumerate(items):
         children = [
             other
@@ -446,8 +540,54 @@ def _parse_format_directory(blocks: list[DocBlock], info: TenderInfo) -> None:
             if other.volume == item.volume and other.number.startswith(item.number + ".")
         ]
         item.children_required = any(child.required for child in children)
-        item.not_applicable = not item.required and not item.children_required
-    _attach_format_templates(blocks, info)
+        if not platform:
+            item.not_applicable = not item.required and not item.children_required
+    return items
+
+
+def _platform_title_key(title: str) -> str:
+    title = re.sub(r"^附表\s*\d+\s*", "", title.strip())
+    return normalize_title(_PLATFORM_PATH_NOTE.split(title, maxsplit=1)[0])
+
+
+def _attach_platform_templates(blocks: list[DocBlock], items: list[FormatItem]) -> None:
+    by_volume = {
+        volume: [(item, _platform_title_key(item.title)) for item in items if item.volume == volume]
+        for volume in _PLATFORM_VOLUMES
+    }
+    candidates: list[tuple[FormatItem, str]] = []
+    current = None
+    for block in blocks:
+        if block.kind == "paragraph":
+            key = _platform_title_key(block.text)
+            if key in by_volume:
+                candidates = by_volume[key]
+                current = None
+                continue
+            if candidates and (block.level or _PLATFORM_TEMPLATE_HEADING.match(block.text)):
+                scored = [(_title_similarity(key, title), item) for item, title in candidates]
+                score, match = max(scored, key=lambda pair: pair[0])
+                if score >= 0.6 and match is not current:
+                    current = match
+                    continue
+        if current is not None:
+            current.template.append(template_paragraph(block) if block.kind == "paragraph"
+                                    else {"kind": "table", "rows": block.rows})
+
+
+def _parse_platform_format_directory(blocks: list[DocBlock], info: TenderInfo, source_path: str) -> bool:
+    for body in format_chapter_bodies(blocks):
+        for index, table in enumerate(body):
+            if table.kind != "table" or tuple(re.sub(r"\s+", "", cell) for cell in table.rows[0]) != _PLATFORM_DIRECTORY_HEADER:
+                continue
+            items = _format_directory_items(table, platform=True)
+            if items:
+                _attach_platform_templates(body[index + 1:], items)
+                info.format_items = items
+                info.format_source = "platform"
+                info.format_source_path = source_path
+                return True
+    return False
 
 
 def _attach_format_templates(blocks: list[DocBlock], info: TenderInfo) -> None:
@@ -558,7 +698,11 @@ def parse_tender_package(entries: list[ArchiveEntry], workspace: Path, archive_n
     matched = re.search(r"(包\s*\d+)", archive_name)
     info.package_no = matched.group(1).replace(" ", "") if matched else ""
     main_blocks: list[DocBlock] = []
+    main_documents: list[tuple[str, list[DocBlock]]] = []
+    scoring_attachments: list[tuple[ArchiveEntry, list[DocBlock] | None]] = []
     for entry in flatten_entries(entries):
+        if entry.is_word_lock_file:
+            continue
         blocks: list[DocBlock] | None = None
         note = ""
         if entry.suffix == ".docx":
@@ -590,12 +734,15 @@ def parse_tender_package(entries: list[ArchiveEntry], workspace: Path, archive_n
                 "note": note,
             }
         )
+        if role == ROLE_SCORING:
+            scoring_attachments.append((entry, blocks))
         if blocks is None:
             continue
         if role == ROLE_INVITATION:
             _parse_invitation(blocks, info)
         elif role == ROLE_MAIN:
             main_blocks.extend(blocks)
+            main_documents.append((entry.logical_path, blocks))
         elif role == ROLE_TECH_SPEC:
             info.tech_specs.append(_parse_tech_spec(entry, blocks))
         elif role == ROLE_CONTRACT:
@@ -603,7 +750,9 @@ def parse_tender_package(entries: list[ArchiveEntry], workspace: Path, archive_n
     if main_blocks:
         _parse_key_clauses(main_blocks, info)
         _parse_scoring(main_blocks, info)
-        legacy_format = _find_table(main_blocks, "提交方式", "格式要求") is not None
+        _parse_category_weights(main_blocks, info)
+        platform_format = any(_parse_platform_format_directory(blocks, info, path) for path, blocks in main_documents)
+        legacy_format = not platform_format and _find_table(main_blocks, "提交方式", "格式要求") is not None
         if legacy_format:
             _parse_format_directory(main_blocks, info)
         parse_integrated_document(main_blocks, info, legacy_format=legacy_format)
@@ -613,6 +762,7 @@ def parse_tender_package(entries: list[ArchiveEntry], workspace: Path, archive_n
             info.warnings.append("未在招标文件中找到“投标文件格式目录”，将按通用货物类投标文件结构编排。")
     else:
         info.warnings.append("未识别到招标文件正文（投标人须知 / 评标办法 / 投标文件格式），评分自查与格式编排将受限。")
+    _parse_scoring_attachments(scoring_attachments, info)
     if not info.project_name:
         info.warnings.append("未识别到招标文件中的项目名称，请在项目信息中手工补充。")
     if not info.validity_days:

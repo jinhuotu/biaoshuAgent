@@ -153,6 +153,7 @@ def generate_bid(
         from api.services.tenders.document import build_bid_docx
 
         builder = build_bid_docx
+    object.__setattr__(brief, '_heading_style_report', {})
     assembly_started = perf_counter()
     _, warnings = builder(
         brief,
@@ -164,6 +165,7 @@ def generate_bid(
         volume=vol,
         defer_layout=True,
     )
+    preserve_headings = brief._heading_style_report.get('source') == 'original'
     logger.info("perf stage=组卷 volume=%s seconds=%.3f", vol, perf_counter() - assembly_started)
     warnings = [*subject_notes, *warnings]
     from docx import Document
@@ -236,7 +238,10 @@ def generate_bid(
             from api.services.tenders.schema import DocumentFormat
             spec = page_format.technicalFormat
             page_format = DocumentFormat(pageNumberStart=spec.pageNumberStart if spec.pageStartSet else 'body')
-        warnings.extend(finalize(rebuilt, brief, page_format, facts=catalog_facts, slots=catalog_slots, media=catalog_media, layout=False))
+        warnings.extend(finalize(
+            rebuilt, brief, page_format, facts=catalog_facts, slots=catalog_slots,
+            media=catalog_media, layout=False, preserve_headings=preserve_headings,
+        ))
         result = getattr(rebuilt.element, '_toc_audit', {})
         rebuilt_ok = bool(result.get('body_count'))
         logger.warning('TOC_FIX_SYNC vol=%s ok=%s', vol, rebuilt_ok)
@@ -277,7 +282,7 @@ def generate_bid(
     production_dir = (Path(__file__).resolve().parents[4] / "storage" / "tenders").resolve()
     final_document = Document(dest)
     if out_dir.resolve() != production_dir:
-        finalize_body_layout(final_document, brief.documentFormat)
+        finalize_body_layout(final_document, brief.documentFormat, preserve_headings=preserve_headings)
         warnings.extend(getattr(final_document.element, "_layout_notes", []))
         final_document.save(dest)
     final_toc = audit(final_document, brief=brief)
@@ -292,7 +297,7 @@ def generate_bid(
     if out_dir.resolve() == production_dir:
         from api.services.tenders.assemble import finalize_word_layout
 
-        warnings.extend(finalize_word_layout(dest, vol, brief.documentFormat))
+        warnings.extend(finalize_word_layout(dest, vol, brief.documentFormat, preserve_headings=preserve_headings))
         final_toc = audit(Document(dest), brief=brief)
         for issue in final_toc['missing']:
             note = f"TOC_MISSING level={issue['level']} title={issue['title']}"

@@ -40,6 +40,7 @@ def to_session_item(
         "mode": session.mode,
         "summary": session.summary,
         "knowledgeBaseIds": [str(x) for x in kb_ids if x],
+        "knowledgeMode": "auto" if session.knowledge_base_ids is None else ("manual" if kb_ids else "off"),
         "messageCount": session.message_count,
         "lastMessageAt": _ts_ms(session.last_message_at),
         "createdAt": _ts_ms(session.created_at),

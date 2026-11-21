@@ -82,7 +82,7 @@ def to_task_item(row: KnowledgeIngestTask, *, doc_name: str | None = None) -> di
     }
 
 
-async def enqueue_ingest_task(
+def stage_ingest_task(
     db: AsyncSession,
     *,
     base: KnowledgeBase,
@@ -98,6 +98,17 @@ async def enqueue_ingest_task(
         force_reextract=bool(force_reextract),
     )
     db.add(row)
+    return row
+
+
+async def enqueue_ingest_task(
+    db: AsyncSession,
+    *,
+    base: KnowledgeBase,
+    doc: KnowledgeDocument,
+    force_reextract: bool = False,
+) -> KnowledgeIngestTask:
+    row = stage_ingest_task(db, base=base, doc=doc, force_reextract=force_reextract)
     await db.commit()
     await db.refresh(row)
     notify_ingest_worker()

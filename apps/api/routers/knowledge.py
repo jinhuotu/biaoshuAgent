@@ -150,6 +150,8 @@ async def bases_update(
     user: CurrentUser,
 ) -> dict:
     await kb_access.require_base(db, user, base_id, kb_access.PERM_MANAGE)
+    if kb_access.is_company_tender_library_id(base_id):
+        raise AppError(ErrorCode.VALIDATION, "请在投标资料库维护公司档案", status_code=422)
     item = await bases_svc.update_base(
         db,
         public_id=base_id,
@@ -164,6 +166,8 @@ async def bases_update(
 @router.delete("/bases/{base_id}")
 async def bases_delete(base_id: str, db: DbSession, user: CurrentUser) -> dict:
     await kb_access.require_base(db, user, base_id, kb_access.PERM_MANAGE)
+    if kb_access.is_company_tender_library_id(base_id):
+        raise AppError(ErrorCode.VALIDATION, "请在投标资料库停用公司档案", status_code=422)
     base = await bases_svc.get_base_by_public_id(db, base_id)
     unlink_base_storage(base_id, list(base.documents or []))
     result = await bases_svc.delete_base(db, public_id=base_id)
@@ -398,6 +402,7 @@ async def knowledge_search(body: SearchRequest, db: DbSession, user: CurrentUser
         top_k=body.topK,
         min_score=body.minScore,
         kb_ids=kb_ids,
+        company_scoped=True,
     )
     return {"code": 0, "msg": "ok", "data": {"chunks": chunks}, "chunks": chunks}
 
@@ -507,7 +512,10 @@ async def documents_download(
         media_type=media_type,
         headers={
             "Content-Disposition": disposition,
-            "Cache-Control": "private, max-age=60",
+            "Cache-Control": (
+                "private, no-store" if kb_access.is_company_tender_library_id(baseId)
+                else "private, max-age=60"
+            ),
         },
     )
 
@@ -531,7 +539,10 @@ async def documents_file(
         content_disposition_type="inline",
         headers={
             "Accept-Ranges": "bytes",
-            "Cache-Control": "private, max-age=60",
+            "Cache-Control": (
+                "private, no-store" if kb_access.is_company_tender_library_id(baseId)
+                else "private, max-age=60"
+            ),
         },
     )
 

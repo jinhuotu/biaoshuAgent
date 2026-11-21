@@ -34,7 +34,7 @@ _TABLE_ROWS_PER_PAGE = 24
 _MAX_REROLLS = 5
 # 解析规则版本：解析器（格式目录、评分、项目事实、需求结构）有改动时递增。
 # 旧版本解析的任务在打开或生成时用任务目录里保留的原件自动重新解析，不需要重新上传。
-PARSER_VERSION = 8  # 8：清单式目录（无格式章节）逐项成节；扫描版 PDF 按框线还原表格
+PARSER_VERSION = 10  # 10：识别独立评分标准附件及物资品类权重
 
 
 class TaskNotFound(LookupError):
@@ -316,6 +316,11 @@ class BidGenService:
     def _public(state: dict) -> dict:
         """返回给前端的任务视图（字段名 camelCase）。"""
         tender = state["tender"]
+        result = state.get("result")
+        score_check = result.get("scoreCheck") if result else None
+        if score_check and not score_check.get("items"):
+            # 已生成任务保留原产物；历史空自查不能因 all([]) 标记通过。
+            result = {**result, "scoreCheck": {**score_check, "available": False, "passed": False, "readBack": False}}
         return {
             "id": state["id"],
             "archiveName": state["archiveName"],
@@ -345,6 +350,7 @@ class BidGenService:
                         "quantity": lot["quantity"],
                         "packageRange": lot["package_range"],
                         "weights": [lot["tech_weight"], lot["business_weight"], lot["price_weight"]],
+                        "scoringCategory": lot.get("scoring_category", ""),
                         "performanceRequirement": lot["performance_requirement"],
                         "awardRule": lot["award_rule"],
                     }
@@ -360,9 +366,12 @@ class BidGenService:
                         "minScore": c["min_score"],
                         "maxScore": c["max_score"],
                         "rule": c["rule"],
+                        "sourcePath": c.get("source_path", ""),
+                        "tiers": c.get("tiers", []),
                     }
                     for c in tender["criteria"]
                 ],
+                "scoringWeights": tender.get("scoring_weights", {}),
                 "formatItems": [
                     {
                         "volume": f["volume"],
@@ -373,6 +382,7 @@ class BidGenService:
                         "hasFormat": f["has_format"],
                         "notApplicable": f["not_applicable"],
                         "port": f["port"],
+                        "submissionMode": f.get("submission_mode", ""),
                     }
                     for f in tender["format_items"]
                 ],
@@ -394,5 +404,5 @@ class BidGenService:
                 "qualificationCount": len(tender["general_qualifications"]),
                 "clauseCount": len(tender["key_clauses"]),
             },
-            "result": state.get("result"),
+            "result": result,
         }

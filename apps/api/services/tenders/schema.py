@@ -285,6 +285,7 @@ class BidBrief(BaseModel):
 
     bidderName: str = Field(default="")
     bidderCreditCode: str = Field(default="", max_length=18)
+    bidderCompanyId: str = Field(default="", max_length=32)
     bidderNature: str = Field(default="")
     companyEstablished: str = Field(default="")
     companyBusinessTerm: str = Field(default="")

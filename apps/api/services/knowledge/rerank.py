@@ -272,10 +272,10 @@ def restrict_slot_hits(
 
 
 def _tender_hit(h: dict[str, Any]) -> bool:
-    from api.services.knowledge.access import TENDER_LIB_PUBLIC_ID
+    from api.services.knowledge.access import is_tender_library_id
 
     kb = str(h.get("kb_id") or h.get("kbId") or "").strip()
-    return kb == TENDER_LIB_PUBLIC_ID
+    return is_tender_library_id(kb)
 
 
 def tender_hit_matches_query(query: str, hit: dict[str, Any]) -> bool:

@@ -20,9 +20,19 @@ from api.services.menus import can_access_menu, user_is_admin
 from common.errors import AppError, ErrorCode
 from db.models.knowledge import KnowledgeBase, KnowledgeBaseAcl
 from db.models.role import Role
+from db.models.tender_library import TenderCompany
 from db.models.user import User
 
 TENDER_LIB_PUBLIC_ID = "tenderlib01"
+COMPANY_TENDER_LIB_PREFIX = "tenderco-"
+
+
+def is_company_tender_library_id(public_id: str) -> bool:
+    return public_id.lower().startswith(COMPANY_TENDER_LIB_PREFIX)
+
+
+def is_tender_library_id(public_id: str) -> bool:
+    return public_id == TENDER_LIB_PUBLIC_ID or is_company_tender_library_id(public_id)
 
 PERM_VIEW = "view"
 PERM_USE = "use"
@@ -112,6 +122,8 @@ async def require_base(
     perm: Perm,
 ) -> KnowledgeBase:
     base = await get_base_by_public_id(db, public_id)
+    if is_company_tender_library_id(base.public_id) and base.status != "active":
+        raise AppError(ErrorCode.NOT_FOUND, "knowledge base not found", status_code=404)
     flags = await perms_for_base(db, user, base)
     if perm in flags:
         return base
@@ -159,6 +171,10 @@ async def list_visible_bases(
     stmt = (
         select(KnowledgeBase)
         .where(KnowledgeBase.status != "deleted")
+        .where(or_(
+            ~KnowledgeBase.public_id.startswith(COMPANY_TENDER_LIB_PREFIX),
+            KnowledgeBase.status == "active",
+        ))
         .options(selectinload(KnowledgeBase.documents))
         .order_by(KnowledgeBase.updated_at.desc())
     )
@@ -168,6 +184,7 @@ async def list_visible_bases(
                 KnowledgeBase.purpose == PURPOSE_RAG,
                 KnowledgeBase.purpose.is_(None),
                 KnowledgeBase.public_id == TENDER_LIB_PUBLIC_ID,
+                KnowledgeBase.id.in_(select(TenderCompany.base_id)),
             )
         )
     elif purpose is not None:

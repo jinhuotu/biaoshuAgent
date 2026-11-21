@@ -42,9 +42,9 @@ def drop_fs_tools_for_tender_lib(
     enabled: list[dict[str, Any]],
     kb_ids: list[str] | None,
 ) -> list[dict[str, Any]]:
-    from api.services.knowledge.access import TENDER_LIB_PUBLIC_ID
+    from api.services.knowledge.access import is_tender_library_id
 
-    if TENDER_LIB_PUBLIC_ID not in {str(x).strip() for x in (kb_ids or []) if str(x).strip()}:
+    if not any(is_tender_library_id(str(x).strip()) for x in (kb_ids or [])):
         return enabled
     return [t for t in enabled if str(t.get("name") or "").strip() not in _FS_TOOL_NAMES]
 

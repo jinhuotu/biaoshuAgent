@@ -169,4 +169,8 @@ async def resolve_menus_with_acl(db, user: User) -> list[str]:
         can_manage = PERM_MANAGE in flags
     except AppError:
         can_manage = False
-    return apply_tender_library_menu(menus, can_manage=can_manage)
+    if can_manage:
+        return apply_tender_library_menu(menus, can_manage=True)
+    from api.services.tenders.company_library import has_company_access
+
+    return apply_tender_library_menu(menus, can_manage=await has_company_access(db, user))

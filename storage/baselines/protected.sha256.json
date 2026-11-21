@@ -1,9 +1,9 @@
 {
   "schema": "protected-baseline/1",
-  "generated_at": "2026-11-08T13:53:24.463746+00:00",
+  "generated_at": "2026-11-20T01:36:56.077372+00:00",
   "root": "D:\\code\\LLM\\weitaiAgent",
   "file_count": 60,
-  "digest": "3edadda5ddf9f605591d3de85ef4138ca1f46b0498084424cc202dc8b4660c10",
+  "digest": "f1784ed330d9e5a4b675b72fa0a65cb6b269c9c70cdc3ec2ed206636d3cece28",
   "files": {
     "apps/api/routers/tenders.py": "e56c9f8492ba41bd9aaf689206323d04287e921d5b431970778df39e788e0b19",
     "apps/api/services/tender_package/GOODS_CONTRACT.md": "a65a8a51f693ef41a9d3c70c36f830ff1863ae873c3a77118be9b77111c852e1",
@@ -64,6 +64,6 @@
     "apps/api/services/tender_package/unpack.py": "77fdad26346558d7d04821f96c998f683a829bd3102b927343e898fa4f450b02",
     "apps/api/services/tender_package/web.py": "00c424b0f6c03f0a84c65a31302f7b5973727511f00d08dcbb546c1508425973",
     "apps/api/services/tender_package/wizard.py": "1dbe41d80922979b036f1941b936e390dcee7476604e563e1145c9b6ecfb5d52",
-    "external::src/views/TendersView.vue": "39b5ab6ca3eb208dc280c6c445d31b5b386e65afb722243e6b03c593b8e2d0a4"
+    "external::src/views/TendersView.vue": "3b1ea36274d8f27ada154624b0adedb5b188d1c848c57bdfed5a1b9bdb6e125a"
   }
 }

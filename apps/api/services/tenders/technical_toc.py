@@ -284,11 +284,13 @@ def audit(doc, candidates=None, brief=None):
     return result
 
 
-def finalize(doc, brief, fmt=None, *, facts=None, slots=None, media=None, layout=True):
+def finalize(doc, brief, fmt=None, *, facts=None, slots=None, media=None, layout=True, preserve_headings=False):
     """One final fill/collect/validate/page path for all generation entry points."""
     from api.services.tenders.document import postprocess_document, finalize_body_layout
     from api.services.tenders.assemble import _fill_toc_pages
-    postprocess_document(doc, brief, facts=facts, slots=slots, media=media, layout=False)
+    postprocess_document(
+        doc, brief, facts=facts, slots=slots, media=media, layout=False, preserve_headings=preserve_headings,
+    )
     sync(doc, brief)
     result = getattr(doc.element, '_toc_audit', {})
     notes = [f"TOC_MISSING level={issue['level']} title={issue['title']}"
@@ -297,7 +299,7 @@ def finalize(doc, brief, fmt=None, *, facts=None, slots=None, media=None, layout
                  for issue in result.get('numbering_gaps', []))
     _fill_toc_pages(doc, fmt or brief.documentFormat, subset=True)
     if layout:
-        finalize_body_layout(doc, fmt or brief.documentFormat)
+        finalize_body_layout(doc, fmt or brief.documentFormat, preserve_headings=preserve_headings)
         notes.extend(getattr(doc.element, '_layout_notes', []))
     return notes
 

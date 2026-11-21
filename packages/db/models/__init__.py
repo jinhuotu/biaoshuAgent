@@ -20,7 +20,7 @@ from db.models.prompt import Prompt
 from db.models.quote import QuoteRecord
 from db.models.role import Role, UserRole
 from db.models.tender import TenderApprovalLog, TenderBidMark, TenderRecord
-from db.models.tender_library import TenderLibraryDismissal
+from db.models.tender_library import TenderCompany, TenderLibraryDismissal
 from db.models.user import User
 from db.models.workflow import Workflow, WorkflowRun, WorkflowRunStep, WorkflowVersion
 
@@ -50,6 +50,7 @@ __all__ = [
     "TenderRecord",
     "TenderApprovalLog",
     "TenderBidMark",
+    "TenderCompany",
     "TenderLibraryDismissal",
     "ApprovalFlow",
 ]

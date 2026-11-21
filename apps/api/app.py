@@ -30,6 +30,7 @@ from api.routers import (
     quotes,
     tenders,
     tender_package,
+    tender_workbench,
     cablepkg,
     users,
     workflows,
@@ -173,6 +174,7 @@ def create_app() -> FastAPI:
     app.include_router(agents.router, prefix=settings.api_prefix)
     app.include_router(knowledge.router, prefix=settings.api_prefix)
     app.include_router(layouts.router, prefix=settings.api_prefix)
+    app.include_router(tender_workbench.router, prefix=settings.api_prefix)
     app.include_router(tenders.router, prefix=settings.api_prefix)
     app.include_router(tender_package.router, prefix=settings.api_prefix)
     app.include_router(cablepkg.router, prefix=settings.api_prefix)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator
 from datetime import datetime
 from typing import TYPE_CHECKING
 
@@ -276,15 +277,27 @@ def _title_key(text: str) -> str:
     return re.sub(r"[（(][^（()）]*[）)]|\s", "", value)
 
 
+def format_chapter_bodies(blocks: list[DocBlock]) -> Iterator[list[DocBlock]]:
+    """取格式章正文，跳过总目录中连续排列的章名。"""
+    start = None
+    for index, block in enumerate(blocks):
+        if block.kind != "paragraph" or not _CHAPTER.match(block.text):
+            continue
+        if start is not None and start < index:
+            yield blocks[start:index]
+        start = index + 1 if _FORMAT_CHAPTER.fullmatch(block.text) else None
+    if start is not None and start < len(blocks):
+        yield blocks[start:]
+
+
 def _formats(blocks: list[DocBlock], info: TenderInfo) -> None:
     from api.services.bidgen.tender_parser import FormatItem
 
-    start = next((i for i, block in enumerate(blocks) if _FORMAT_CHAPTER.fullmatch(block.text)), None)
-    if start is None:
+    body = next(format_chapter_bodies(blocks), [])
+    if not body:
         _composition_formats(blocks, info)
         _finish_formats(info)
         return
-    body = blocks[start + 1:]
     # 格式章节开头的“目录”逐行列出一级条目：记下标题，正文里没设标题样式的同名条目也能认出，目录本身不当正文
     toc: list[str] = []
     toc_end = 0
@@ -325,8 +338,6 @@ def _formats(blocks: list[DocBlock], info: TenderInfo) -> None:
     current = None
     for block in body[toc_end:]:
         if block.kind == "paragraph":
-            if _CHAPTER.match(block.text):
-                break
             text = block.text
             if "\n" in text and block.level:
                 # 标题段落前面粘着上一节的备注（“备注：……\n三、报价表”）：备注归上一节，末行作标题

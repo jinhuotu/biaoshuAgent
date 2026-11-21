@@ -66,6 +66,7 @@ from api.services.tenders.tables import (
     width_ratios,
 )
 from api.services.tenders.value_policy import should_fill
+from api.services.tenders.word_structure import outline_level
 
 logger = logging.getLogger("api.tenders")
 
@@ -122,7 +123,12 @@ def _title_style_name(name: str | None) -> bool:
     }
 
 
-def normalize_document_colors(doc: Document) -> int:
+def is_word_heading(doc: Document, paragraph: Paragraph) -> bool:
+    """Recognize named title styles and heading levels defined in the source Word."""
+    return _title_style_name(paragraph.style.name) or bool(outline_level(doc, paragraph._p))
+
+
+def normalize_document_colors(doc: Document, *, preserve_headings: bool = False) -> int:
     """Make title styles and every explicit run color deterministic black."""
     style_names = {style.style_id: style.name for style in doc.styles}
     from api.services.tenders.directory_guard import cover_nodes
@@ -147,21 +153,29 @@ def normalize_document_colors(doc: Document) -> int:
                 del color.attrib[key]
                 changed += 1
 
-    for style in doc.styles:
-        if _title_style_name(style.name) and style.style_id not in cover_styles:
-            blacken(style.element.get_or_add_rPr())
+    if not preserve_headings:
+        for style in doc.styles:
+            if _title_style_name(style.name) and style.style_id not in cover_styles:
+                blacken(style.element.get_or_add_rPr())
 
     for part in doc.part.package.parts:
         root = getattr(part, "element", None)
         if root is None:
             continue
+        if preserve_headings and root.tag in {qn("w:styles"), qn("w:numbering")}:
+            # Headings may inherit color from a base style or list definition.
+            continue
+        headings = set()
+        if preserve_headings:
+            headings = {node for node in root.iter(qn("w:p"))
+                        if is_word_heading(doc, Paragraph(node, doc))}
         for rpr in root.iter(qn("w:rPr")):
-            if rpr in cover:
+            if rpr in cover or (headings and next(rpr.iterancestors(qn("w:p")), None) in headings):
                 continue
             if rpr.find(qn("w:color")) is not None:
                 blacken(rpr)
         for paragraph in root.iter(qn("w:p")):
-            if paragraph in cover:
+            if paragraph in cover or paragraph in headings:
                 continue
             ppr = paragraph.find(qn("w:pPr"))
             style_id = ppr.find(qn("w:pStyle")).get(qn("w:val")) if ppr is not None and ppr.find(qn("w:pStyle")) is not None else None
@@ -180,11 +194,11 @@ _TEXT_HEADING_NUMBER = re.compile(
 )
 
 
-def _title_layout(doc: Document, fmt=None) -> tuple[int, list[str]]:
+def _title_layout(doc: Document, fmt=None, *, preserve_headings: bool = False) -> tuple[int, list[str]]:
     """Fit body headings and project directory rows from their heading bookmarks."""
     from api.services.tenders.schema import DocumentFormat
     from api.services.tenders.technical_toc import _regions
-    from api.services.tenders.word_structure import numbering_labels, outline_level
+    from api.services.tenders.word_structure import numbering_labels
 
     regions = _regions(doc)
     from api.services.tenders.directory_guard import cover_nodes
@@ -228,7 +242,8 @@ def _title_layout(doc: Document, fmt=None) -> tuple[int, list[str]]:
         level = outline_level(doc, p._p)
         if level or _title_style_name(p.style.name):
             levels[p._p] = level
-            headings.setdefault(p.style.style_id, []).append(p)
+            if not preserve_headings:
+                headings.setdefault(p.style.style_id, []).append(p)
         else:
             body_sizes[effective_size(p)] += 1
     body_size = body_sizes.most_common(1)[0][0] if body_sizes else (
@@ -296,7 +311,7 @@ def _title_layout(doc: Document, fmt=None) -> tuple[int, list[str]]:
 
     labels = numbering_labels(doc, [p._p for p in paragraphs if p._p not in excluded])
     for p in paragraphs:
-        if p._p in levels and p._p in labels and not _TEXT_HEADING_NUMBER.match(p.text):
+        if not preserve_headings and p._p in levels and p._p in labels and not _TEXT_HEADING_NUMBER.match(p.text):
             warnings.append(f"标题仅有自动编号，待确认（段 {indexes[p._p]}）：{p.text.strip()}")
 
     def shown_title(p):
@@ -3309,7 +3324,7 @@ def _replace_inline_span(paragraph: Paragraph, start: int, end: int, replacement
         offset = limit
 
 
-def _split_role_paragraphs(doc: Document) -> int:
+def _split_role_paragraphs(doc: Document, *, preserve_headings: bool = False) -> int:
     """Split mixed roles before filling, preserving the original final section edge."""
     from api.services.tenders.directory_guard import directory_blocks, cover_nodes
     from api.services.tenders.pdf_format import _STAMP
@@ -3322,6 +3337,8 @@ def _split_role_paragraphs(doc: Document) -> int:
                 or node.xpath('./w:pPr/w:pBdr') or any(a.tag in {qn('w:tc'), qn('w:txbxContent')} for a in node.iterancestors())):
             continue
         p = Paragraph(node, doc._body)
+        if preserve_headings and is_word_heading(doc, p):
+            continue
         text = ''.join(value for _, value in _inline_nodes(p))
         if re.fullmatch(_STAMP, text.strip()):
             previous = node.getprevious()
@@ -3332,7 +3349,8 @@ def _split_role_paragraphs(doc: Document) -> int:
                 previous = previous.getprevious()
             if previous is not None and previous.tag == qn('w:p') and previous not in excluded:
                 prior = Paragraph(previous, doc._body)
-                if (_paragraph_role(prior)[0] == 'signing'
+                if ((not preserve_headings or not is_word_heading(doc, prior))
+                        and _paragraph_role(prior)[0] == 'signing'
                         and not previous.xpath('.//w:sectPr | .//w:drawing | .//w:br[@w:type="page"]')
                         and not node.xpath('.//w:sectPr | .//w:br[@w:type="page"]')):
                     for child in list(node):
@@ -3377,7 +3395,7 @@ def _split_role_paragraphs(doc: Document) -> int:
     return changed
 
 
-def _signoff_blocks(doc):
+def _signoff_blocks(doc, *, preserve_headings: bool = False):
     """Return contiguous body rows that can form one signoff block.
 
     Tables, text boxes, bordered paste frames and protected cover/directory
@@ -3386,7 +3404,6 @@ def _signoff_blocks(doc):
     """
     from api.services.tenders.directory_guard import cover_nodes, directory_blocks
     from api.services.tenders.technical_toc import _regions
-    from api.services.tenders.word_structure import outline_level
     excluded = cover_nodes(doc) | directory_blocks(doc) | {
         n for region in _regions(doc) for host in region for n in host.iter()}
     blocks, current = [], []
@@ -3400,6 +3417,9 @@ def _signoff_blocks(doc):
             finish()
             continue
         p = Paragraph(node, doc._body)
+        if preserve_headings and is_word_heading(doc, p):
+            finish()
+            continue
         text = ''.join(value for _, value in _inline_nodes(p))
         if node.xpath('./w:pPr/w:pageBreakBefore[not(@w:val) or @w:val="1" or @w:val="true"]'):
             finish()
@@ -3491,10 +3511,11 @@ def _information_context(block, index: int) -> bool:
     return after
 
 
-def _align_business_signoffs(doc: Document, seal_paragraphs=None) -> int:
+def _align_business_signoffs(doc: Document, seal_paragraphs=None, *, preserve_headings: bool = False) -> int:
     """Separate information rows from signed tails while retaining source layout."""
-    changed, reports = _split_role_paragraphs(doc), []
-    for block in _signoff_blocks(doc):
+    changed = _split_role_paragraphs(doc, preserve_headings=preserve_headings)
+    reports = []
+    for block in _signoff_blocks(doc, preserve_headings=preserve_headings):
         actions = [i for i, (p, role, _) in enumerate(block)
                    if role == 'signing' and _SIGNOFF_SEAL.search(p.text)]
         dates = [(p, match) for p, role, match in block if role == 'date']
@@ -3614,9 +3635,9 @@ def postprocess_business_document(doc: Document, brief: BidBrief, *, layout=True
     return changed + (_align_business_signoffs(doc, seal_paragraphs) if layout else 0)
 
 
-def _normalize_structure_roles(doc, *, layout=True, outline=True):
+def _normalize_structure_roles(doc, *, layout=True, outline=True, preserve_headings=False):
     from api.services.tenders.technical_toc import _regions
-    from api.services.tenders.word_structure import outline_level, numbering_labels
+    from api.services.tenders.word_structure import numbering_labels
     from api.services.tenders.directory_guard import cover_nodes
     cover = cover_nodes(doc)
     regions = _regions(doc)
@@ -3636,6 +3657,8 @@ def _normalize_structure_roles(doc, *, layout=True, outline=True):
         if node in cover:
             continue
         p = Paragraph(node, doc._body)
+        if preserve_headings and is_word_heading(doc, p):
+            continue
         role, _ = _paragraph_role(p)
         protected_container = bool(node.xpath('ancestor::w:tc | ancestor::w:txbxContent | ./w:pPr/w:pBdr'))
         host = node
@@ -3686,7 +3709,7 @@ def _normalize_structure_roles(doc, *, layout=True, outline=True):
             # Their alignment, indentation, line breaks and tabs are data.
             if not protected_container:
                 changed += _left_role(p)
-    return changed + normalize_document_colors(doc)
+    return changed + normalize_document_colors(doc, preserve_headings=preserve_headings)
 
 
 def _clean_template_residue(doc, brief):
@@ -3736,14 +3759,14 @@ def _clean_template_residue(doc, brief):
     return changed
 
 
-def postprocess_document(doc, brief, *, facts=None, slots=None, media=None, layout=True):
+def postprocess_document(doc, brief, *, facts=None, slots=None, media=None, layout=True, preserve_headings=False):
     """Shared final body pass; decisions use paragraph roles, never volume names."""
     from api.services.tenders.pdf_format import (_LABEL_FIELDS, _fill_label_gap, _fill_empty_label_cells,
                                                 _following_inline_unit, reconcile_person_field_values)
     from api.services.tenders.section_materials import reconcile_generated_slots
     backed, sources = _fact_backed_brief(brief, facts)
     changed = _clean_template_residue(doc, backed)
-    changed += _split_role_paragraphs(doc)
+    changed += _split_role_paragraphs(doc, preserve_headings=preserve_headings)
     person_repairs = reconcile_person_field_values(doc, backed)
     changed += len(person_repairs)
     fields = fill_inline_labeled_blanks(doc, backed)
@@ -3763,21 +3786,21 @@ def postprocess_document(doc, brief, *, facts=None, slots=None, media=None, layo
     materials = reconcile_generated_slots(doc, backed, slots=slots, media=media)
     changed += materials['changed']
     changed += postprocess_business_document(doc, backed, layout=False)
-    changed += _normalize_structure_roles(doc, layout=False)
+    changed += _normalize_structure_roles(doc, layout=False, preserve_headings=preserve_headings)
     if layout:
-        changed += finalize_body_layout(doc, brief.documentFormat)
+        changed += finalize_body_layout(doc, brief.documentFormat, preserve_headings=preserve_headings)
     result = {'changed': changed, 'fields': fields, 'sources': sources, 'materials': materials,
               'person_repairs': person_repairs}
     doc.element._postprocess_audit = result
     return result
 
 
-def finalize_body_layout(doc, fmt=None):
+def finalize_body_layout(doc, fmt=None, *, preserve_headings=False):
     """Run after all content writers and directory recovery on the final object."""
-    changed, notes = _title_layout(doc, fmt)
+    changed, notes = _title_layout(doc, fmt, preserve_headings=preserve_headings)
     doc.element._layout_notes = notes
-    changed += _normalize_structure_roles(doc, outline=False)
-    changed += _align_business_signoffs(doc)
+    changed += _normalize_structure_roles(doc, outline=False, preserve_headings=preserve_headings)
+    changed += _align_business_signoffs(doc, preserve_headings=preserve_headings)
     notes.extend('SIGNOFF_NEEDS_REVIEW paragraph=' + path
                  for block in getattr(doc.element, '_signoff_audit', []) for path in block['pending'])
     if 'Technical Section Heading' in doc.styles:

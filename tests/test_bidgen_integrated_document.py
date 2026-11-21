@@ -149,6 +149,89 @@ def test_format_body_sequence_ignores_toc_and_retains_templates(tmp_path):
     assert not any("未在招标文件中找到" in warning for warning in info.warnings)
 
 
+def test_platform_directory_uses_body_table_and_keeps_volume_and_delivery_rules(tmp_path):
+    # 手工摘录 SL2612 第六章目录及对应正文。总目录和正文中的章名文字相同。
+    info = parse_document(tmp_path, [
+        "目 录", "第一章 投标邀请书", "第六章 投标文件格式",
+        ("第二章 投标人须知", 1), f"项目名称：{PROJECT}",
+        ("第六章 投标文件格式", 1), "在电子商务平台下载本项目的SGCC包。",
+        [["序号", "内容", "电子商务平台", "招投标智能服务平台", "是否有格式要求", "电子商务平台离线投标工具上传端口"],
+         ["一", "价格文件（按包制作）", "", "", "", "“价格文件”端口"],
+         ["1", "投标函及附件", "√", "", "√", "供应商投标工具按包投标后自动生成"],
+         ["附表1", "已标价货物清单行报价暨投标报价汇总表", "√", "", "√", "供应商投标工具按包投标后自动生成"],
+         ["二", "商务文件（按分标制作）", "", "", "", "“商务文件”端口"],
+         ["1", "商务偏差表", "√", "√", "√", "“商务偏差表”端口；如商务无偏差，在投标工具处选择商务无偏差"],
+         ["2", "补充文件", "", "", "", "“补充文件”端口"],
+         ["2.2", "投标保证金（本批次不涉及）", "×", "×", "×", ""],
+         ["2.3", "财务信息（如需）", "√", "√", "√", ""],
+         ["三", "技术文件（按分标制作）", "", "", "", "“技术文件”端口"],
+         ["1", "项目货物技术特性逐条逐项应答文件", "√", "√", "√", "离线投标工具按包应答后自动生成"],
+         ["2", "技术偏差表", "√", "√", "√", "“技术偏差表”端口；如技术无偏差，在投标工具处选择技术无偏差"],
+         ["3", "专项投标文件", "√", "√", "√", "“专项投标文件”端口"],
+         ["3.1", "创新能力", "√", "√", "×", ""],
+         ["3.6", "剩余生产能力表（如有）", "√", "√", "√", ""],
+         ["四", "资质业绩文件（按分标制作）", "", "", "", ""],
+         ["1", "外购外协供应商资质业绩凭证单（如有）", "√", "×", "√", "“技术资质业绩凭证单管理”端口"]],
+        ("价格文件", 2), ("（一）投标函及附件（在投标工具在线填写并由系统自动生成）", 3), "价格投标函原文。",
+        "附表1 已标价货物清单行报价暨投标报价汇总表", [["未含税单价", "税率"]],
+        ("商务文件（根据本单位信息系统情况编制）", 2),
+        "（一）商务偏差表（可在投标工具直接选择无/有偏差）", [["招标文件条目号", "投标文件条款"]],
+        ("（二）补充文件", 3), ("3.财务信息", 3), "财务原文。",
+        ("三、技术文件", 2), ("（一）项目货物技术特性逐条逐项应答文件", 3), "离线投标工具按包应答后自动生成。",
+        ("（二）技术偏差表（投标工具路径：技术文件）", 3), [["偏差事项", "投标文件响应"]],
+        ("（三）专项投标文件（投标工具路径：技术文件）", 3), ("1.创新能力", 3), "创新能力编写说明。",
+        "6.剩余生产能力表（如有）", [["投标人名称", "生产能力及供货数量"]],
+        ("四、资质业绩文件", 2), "1.外购外协供应商资质业绩凭证单（如有）", "凭证单原文。",
+        ("第七章 其他内容", 1), "不得进入格式模板。",
+    ])
+
+    assert info.format_source == "platform"
+    assert info.format_source_path == "招标文件正文.docx"
+    assert [(item.volume, item.number) for item in info.format_items] == [
+        ("价格文件", "1"), ("价格文件", "附表1"), ("商务文件", "1"), ("商务文件", "2"),
+        ("商务文件", "2.2"), ("商务文件", "2.3"), ("技术文件", "1"), ("技术文件", "2"),
+        ("技术文件", "3"), ("技术文件", "3.1"), ("技术文件", "3.6"), ("资质业绩文件", "1"),
+    ]
+    items = {(item.volume, item.number): item for item in info.format_items}
+    auto = items["技术文件", "1"]
+    assert (auto.submission_mode, auto.port, auto.has_format, auto.required) == (
+        "tool_generated", "离线投标工具按包应答后自动生成", True, True,
+    )
+    deviation = items["技术文件", "2"]
+    assert (deviation.submission_mode, deviation.port, deviation.template) == (
+        "conditional_deviation", "“技术偏差表”端口；如技术无偏差，在投标工具处选择技术无偏差",
+        [{"kind": "table", "rows": [["偏差事项", "投标文件响应"]]}],
+    )
+    assert (items["技术文件", "3"].title, items["技术文件", "3"].port, items["技术文件", "3"].children_required) == (
+        "专项投标文件", "“专项投标文件”端口", True,
+    )
+    innovation = items["技术文件", "3.1"]
+    assert (innovation.level, innovation.title, innovation.has_format, innovation.template) == (
+        2, "创新能力", False, [{"kind": "paragraph", "text": "创新能力编写说明。"}],
+    )
+    capacity = items["技术文件", "3.6"]
+    assert (capacity.title, capacity.has_format, capacity.template) == (
+        "剩余生产能力表（如有）", True, [{"kind": "table", "rows": [["投标人名称", "生产能力及供货数量"]]}],
+    )
+    assert items["商务文件", "2.2"].not_applicable is True
+    assert items["商务文件", "2"].children_required is True
+    assert items["价格文件", "附表1"].template == [{"kind": "table", "rows": [["未含税单价", "税率"]]}]
+    assert items["资质业绩文件", "1"].template == [{"kind": "paragraph", "text": "凭证单原文。"}]
+    assert not any("未在招标文件中找到" in warning for warning in info.warnings)
+
+    from api.services.bidgen.composer import compose_document
+    from api.services.bidgen.document_model import ComposeContext
+    from api.services.bidgen.profile import DEFAULT_PROFILE
+
+    ctx = ComposeContext(tender=info.to_dict(), profile=DEFAULT_PROFILE, lots=[], options={})
+    roots = compose_document(ctx)
+    sections = {node.key: node for root in roots for node in root.walk()}
+    assert sections["technical.1"].plain_text().endswith(auto.port)
+    assert deviation.port in sections["technical.2"].plain_text()
+    assert "我方已对" not in sections["technical.2"].plain_text()
+    assert [node.key for node in sections["technical.3"].children] == ["technical.3.1", "technical.3.6"]
+
+
 def test_unknown_validity_is_not_invented(tmp_path):
     info = parse_document(tmp_path, ["投标人须知", "投标截止时间：2026年11月20日10:00"])
     assert info.validity_days == 0

@@ -357,7 +357,7 @@ _VOL_BIZ = re.compile(r"商务标|商务部分|商务文件")
 _RULE_WORD = re.compile(r"页边距|字体|正文|页码|磅|小四|小三|四号|三号")
 
 
-def apply_volume_format(doc, spec: VolumeFormat, *, where: str = "副本") -> list[str]:
+def apply_volume_format(doc, spec: VolumeFormat, *, where: str = "副本", preserve_headings: bool = False) -> list[str]:
     """只改这一卷写明的页边距、正文和页码。表格、签章栏不动。"""
     if spec is None:
         return []
@@ -374,8 +374,14 @@ def apply_volume_format(doc, spec: VolumeFormat, *, where: str = "副本") -> li
             f" 左{spec.marginLeftCm:g} 右{spec.marginRightCm:g}cm"
         )
     if spec.fontSet or spec.bodySizeSet:
-        before = _sample_body_font(doc)
-        n = _paint_body_runs(doc, spec)
+        from api.services.tenders.document import is_word_heading
+
+        paragraphs = [
+            para for para in doc.paragraphs
+            if _body_para(para.text) and (not preserve_headings or not is_word_heading(doc, para))
+        ]
+        before = _sample_body_font(paragraphs)
+        n = _paint_body_runs(paragraphs, spec)
         if n:
             want = _spec_font_label(spec)
             if before:
@@ -508,10 +514,8 @@ def _body_para(text: str) -> bool:
     return True
 
 
-def _sample_body_font(doc) -> str:
-    for para in doc.paragraphs:
-        if not _body_para(para.text):
-            continue
+def _sample_body_font(paragraphs) -> str:
+    for para in paragraphs:
         for run in para.runs:
             name = _run_east_asia(run)
             size = run.font.size.pt if run.font.size is not None else None
@@ -533,10 +537,10 @@ def _spec_font_label(spec: VolumeFormat) -> str:
     return " ".join(bits) or "标书字体"
 
 
-def _paint_body_runs(doc, spec: VolumeFormat) -> int:
+def _paint_body_runs(paragraphs, spec: VolumeFormat) -> int:
     n = 0
-    for para in doc.paragraphs:
-        if not _body_para(para.text) or not para.runs:
+    for para in paragraphs:
+        if not para.runs:
             continue
         for run in para.runs:
             if spec.fontSet and spec.fontName:

@@ -266,7 +266,7 @@ async def _word_library_inputs(db, brief):
     import hashlib
 
     try:
-        base = await library.get_base_by_public_id(db, library.TENDER_LIB_PUBLIC_ID)
+        base = await library.read_library_base(db)
     except AppError as exc:
         if exc.status_code != 404:
             raise
@@ -339,14 +339,27 @@ async def _generate_for_record(
     *,
     peer_ready: bool = False,
     material_owner_id: int | None = None,
+    company_user: User | None = None,
+    previous_bidder: dict | None = None,
 ) -> tuple[dict[str, object], dict[str, object]]:
     from api.services.tenders.demo import build_demo_output, demo_enabled
 
-    if demo_enabled():
+    if demo_enabled() and not brief.bidderCompanyId:
         generated = await build_demo_output(brief)
         empty = {"matched": [], "missingFiles": [], "createdItems": []}
         return generated, empty
     extra = {'material_owner_id': material_owner_id} if material_owner_id is not None else {}
+    if brief.bidderCompanyId:
+        from api.services.tenders.classic_company import authorize_company_bidder, validate_record_bidder
+        from api.services.tenders.library_scope import use_company_base
+
+        if company_user is None:
+            raise AppError(ErrorCode.FORBIDDEN, "无法校验投标公司权限", status_code=403)
+        base = await authorize_company_bidder(db, company_user, brief)
+        if previous_bidder is not None:
+            validate_record_bidder(previous_bidder, brief)
+        with use_company_base(base):
+            return await _prepare_and_generate(db, brief, peer_ready=peer_ready, **extra)
     return await _prepare_and_generate(db, brief, peer_ready=peer_ready, **extra)
 
 
@@ -504,6 +517,8 @@ async def _prepare_and_generate(
     *,
     peer_ready: bool = False,
     material_owner_id: int | None = None,
+    workbench_attachments: dict[str, list[Path]] | None = None,
+    saved_chapters_only: bool = False,
 ) -> tuple[dict[str, object], dict[str, object]]:
     """跑生成管道，返回 (generated, attachment_match)。会就地补全 brief 的槽位字段。"""
     import time
@@ -690,6 +705,8 @@ async def _prepare_and_generate(
             media["id_legal"] = await filter_legal_id_attachments(db, media["id_legal"], picked)
             if not media["id_legal"]:
                 media.pop("id_legal", None)
+    if workbench_attachments:
+        media.update(workbench_attachments)
     checked_keys = list(dict.fromkeys([
         *required_keys, *(slot.key for slot in slots if slot.key in CRITICAL_SLOT_KEYS),
     ]))
@@ -713,7 +730,7 @@ async def _prepare_and_generate(
     other_pledges = []
     technical_package_active = False
     wants_scoring = both or vol in {"business", "full"}
-    wants_package = both or vol in {"technical", "full"}
+    wants_package = not saved_chapters_only and (both or vol in {"technical", "full"})
     parallel_results = None
     if wants_scoring and wants_package and db is not None:
         logger.info("pre-generation parallel: scoring_narrative + technical_package")
@@ -776,7 +793,9 @@ async def _prepare_and_generate(
 
         _user_sources(brief.techPlanSourceIds, brief=brief, notes=draft_notes)
         draft_notes.append('本次未启用技术方案自动起草，上传技术资料未送入模型')
-    if not technical_package_active and (needs_tech_body or (getattr(brief, "autoDraftTechPlan", False) and (both or vol in {"technical", "full"}))):
+    if not saved_chapters_only and not technical_package_active and (
+        needs_tech_body or (brief.autoDraftTechPlan and (both or vol in {"technical", "full"}))
+    ):
         from api.services.tenders.gen_tech_plan import draft_technical_plan
 
         draft_brief = brief.model_copy(deep=True) if reference_ids else brief
@@ -967,6 +986,8 @@ async def _create_record_from_generate(
 ) -> dict[str, object]:
     """生成 Word。未到下载定稿前记为草稿，不出现在生成记录里。"""
     extra = {'material_owner_id': user_id} if brief.bidTableImportId or any(c.enabled for c in brief.materialSelections.values()) else {}
+    if brief.bidderCompanyId:
+        extra["company_user"] = await db.get(User, user_id)
     generated, attachment_match = await _generate_for_record(db, brief, **extra)
     # 没走到下载定稿前只留草稿，列表里看不到；换一份时清掉本人旧草稿
     await _drop_user_drafts(db, user_id)
@@ -1300,6 +1321,10 @@ async def regenerate_from_record(
         previous = BidBrief.model_validate(row.brief_json)
         if previous.invitationId == brief.invitationId:
             brief.libraryBindings = previous.libraryBindings
+    if isinstance(row.brief_json, dict):
+        from api.services.tenders.classic_company import preserve_record_company
+
+        preserve_record_company(row.brief_json, brief)
     old_docx, old_tech, old_pdf = row.docx_file, getattr(row, "tech_docx_file", None), row.pdf_file
     vol = generate_volume(brief)
     both = bool(brief.generateBoth)
@@ -1310,6 +1335,10 @@ async def regenerate_from_record(
     else:
         peer_ready = _output_exists(old_tech)
     extra = {'material_owner_id': int(row.user_id)} if brief.bidTableImportId or any(c.enabled for c in brief.materialSelections.values()) else {}
+    if brief.bidderCompanyId:
+        extra["company_user"] = user
+        if isinstance(row.brief_json, dict):
+            extra["previous_bidder"] = row.brief_json
     generated, attachment_match = await _generate_for_record(db, brief, peer_ready=peer_ready, **extra)
     _apply_generated_files(row, brief, generated)
     await db.commit()

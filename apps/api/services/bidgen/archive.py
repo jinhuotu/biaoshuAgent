@@ -39,6 +39,10 @@ class ArchiveEntry:
     storage_path: str = ""
     children: list[ArchiveEntry] = field(default_factory=list)
 
+    @property
+    def is_word_lock_file(self) -> bool:
+        return self.name.startswith("~$") and self.suffix.lower() in (".doc", ".docx", ".docm", ".dot", ".dotx", ".dotm")
+
     def to_dict(self) -> dict:
         return asdict(self)
 

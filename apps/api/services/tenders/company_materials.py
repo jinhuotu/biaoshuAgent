@@ -52,12 +52,12 @@ def _profile_tags(raw: str, source: str) -> list[str]:
 async def library_company_profile(db, brief) -> tuple[dict, set]:
     """Collect explicit fields from company-scoped licences and legal IDs."""
     from api.services.tenders.library_kb import (
-        TENDER_LIB_PUBLIC_ID, _doc_file_path, _list_docs, get_base_by_public_id, key_from_tags,
+        _doc_file_path, _list_docs, key_from_tags, read_library_base,
     )
     from common.errors import AppError
 
     try:
-        base = await get_base_by_public_id(db, TENDER_LIB_PUBLIC_ID)
+        base = await read_library_base(db)
     except AppError as exc:
         if exc.status_code == 404:
             return {}, set()
@@ -126,9 +126,9 @@ def source_material_evidence(doc, key=''):
     if getattr(doc, '_source_evidence_key', None) == key:
         return doc
     from api.services.knowledge.ingest import read_extracted_text
-    from api.services.tenders.library_kb import TENDER_LIB_PUBLIC_ID
+    from api.services.tenders.library_kb import current_library_id
     from api.services.tenders.company_identity import COMPANY_RE, named_bidders
-    raw = read_extracted_text(TENDER_LIB_PUBLIC_ID, getattr(doc, 'public_id', '')) or ''
+    raw = read_extracted_text(current_library_id(), getattr(doc, 'public_id', '')) or ''
     if not raw:
         summary = getattr(doc, 'summary', '') or ''
         raw = summary if not summary.startswith(('FACTS:', 'PERFJSON:', 'idcard:')) else ''
@@ -193,10 +193,10 @@ async def library_bidder_name(db, current=''):
     """Resolve a unique verified full owner name; never choose among companies."""
     if db is None:
         return current
-    from api.services.tenders.library_kb import get_base_by_public_id, TENDER_LIB_PUBLIC_ID, _list_docs, _doc_file_path
+    from api.services.tenders.library_kb import _list_docs, _doc_file_path, read_library_base
     from common.errors import AppError
     try:
-        base = await get_base_by_public_id(db,TENDER_LIB_PUBLIC_ID)
+        base = await read_library_base(db)
     except AppError as exc:
         if exc.status_code == 404:
             return current
@@ -273,12 +273,12 @@ def document_matches_company(doc, brief, *, key=''):
 
 async def scoped_library_media(db, brief, media):
     from api.services.tenders.library_kb import (
-        get_base_by_public_id, TENDER_LIB_PUBLIC_ID, _list_docs, _doc_file_path, key_from_tags,
+        _list_docs, _doc_file_path, key_from_tags, read_library_base,
     )
     from common.errors import AppError
 
     try:
-        base = await get_base_by_public_id(db, TENDER_LIB_PUBLIC_ID)
+        base = await read_library_base(db)
     except AppError as exc:
         if exc.status_code != 404:
             raise

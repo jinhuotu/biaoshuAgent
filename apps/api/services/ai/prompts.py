@@ -6,7 +6,7 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from api.services.knowledge.access import TENDER_LIB_PUBLIC_ID
+from api.services.knowledge.access import is_tender_library_id
 
 # 本轮事实标记；怎么回答写在「提示词管理」里的智能助手正文。
 KB_MISS_MARK = "【知识库检索结果】未检索到匹配片段。"
@@ -23,7 +23,7 @@ def uses_tender_lib(
 ) -> bool:
     _ = kb_ids
     return any(
-        str(c.get("kb_id") or c.get("kbId") or "").strip() == TENDER_LIB_PUBLIC_ID
+        is_tender_library_id(str(c.get("kb_id") or c.get("kbId") or "").strip())
         for c in chunks
     )
 

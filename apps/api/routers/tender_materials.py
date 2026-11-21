@@ -3,6 +3,8 @@ from fastapi import APIRouter, File, Form, Query, UploadFile
 from fastapi.responses import FileResponse
 
 from api.deps import CurrentUser, DbSession, user_is_admin
+from api.routers.tender_classic_company import router as classic_company_router
+from api.routers.tender_companies import router as companies_router
 from api.services.knowledge import access as kb_access
 from api.services.knowledge.ingest import get_document_preview, resolve_document_file
 from api.services.knowledge.parsers import extract_text_from_file
@@ -13,6 +15,8 @@ from common.errors import AppError, ErrorCode
 from common.response import ok
 
 router = APIRouter(prefix='/materials', tags=['tender materials'])
+router.include_router(companies_router)
+router.include_router(classic_company_router)
 
 
 def allow(user):

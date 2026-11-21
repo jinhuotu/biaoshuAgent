@@ -89,7 +89,9 @@ def _invitation_text(service, state) -> str:
     entries = [service._entry_from_dict(item) for item in state.get("tree", [])]
     text = []
     for entry in flatten_entries(entries):
-        if entry.suffix != ".docx" or roles.get(entry.logical_path) not in {"main", "invitation"}:
+        if entry.is_word_lock_file or entry.suffix != ".docx":
+            continue
+        if roles.get(entry.logical_path) not in {"main", "invitation"}:
             continue
         path = (workspace / entry.storage_path).resolve()
         if not path.is_relative_to(workspace.resolve()):

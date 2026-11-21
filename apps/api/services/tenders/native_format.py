@@ -1132,7 +1132,7 @@ def _sync_format_outline(brief: BidBrief, items: list[OutlineItem]) -> list[Outl
     return ordered
 
 
-def ensure_toc_rows(doc, brief: BidBrief, *, volume: str = "") -> None:
+def ensure_toc_rows(doc, brief: BidBrief, *, volume: str = "", preserve_headings: bool = False) -> None:
     """Rebuild only chapter rows, with stable real-body anchors and numbered levels."""
     from api.services.tenders.assemble import _fill_toc_pages
     from api.services.tenders.document import (
@@ -1198,7 +1198,7 @@ def ensure_toc_rows(doc, brief: BidBrief, *, volume: str = "") -> None:
             Paragraph(placed[0][1], doc).paragraph_format.page_break_before = True
             _collapse_toc_page_breaks(placed[0][0])
         return
-    if format_toc:
+    if format_toc and not preserve_headings:
         # The invitation's original labels are input data, not the output
         # sequence.  Reuse the canonical outline renumberer for both the
         # physical headings and the rows rebuilt below.

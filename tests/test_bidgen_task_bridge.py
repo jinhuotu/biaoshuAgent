@@ -1,8 +1,10 @@
 """新版任务登记和审批闭环。独立样例，不依赖 seed 或外部数据库。"""
 
 from copy import deepcopy
+from io import BytesIO
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+from zipfile import ZipFile
 
 import pytest
 from docx import Document
@@ -11,7 +13,8 @@ from sqlalchemy.orm import Session
 from api.routers import bid_gen
 
 from api.services.bidgen import task_bridge as bridge
-from api.services.bidgen.service import BidGenService
+from api.services.bidgen.archive import ArchiveEntry
+from api.services.bidgen.service import PARSER_VERSION, BidGenService
 from api.services.bidgen.tender_parser import TenderInfo
 from api.services.tenders import records
 from api.services.tenders.assets import load_invitation_text
@@ -78,7 +81,7 @@ def setup_bridge(tmp_path, monkeypatch):
         files.append({"key": key, "label": label, "name": name, "size": 1, "estimatedPages": 1})
     state = {"id": identifier, "archiveName": "招标正文.docx", "status": "generated",
              "createdAt": "2026-11-17T10:00:00", "updatedAt": "2026-11-17T10:00:01",
-             "parserVersion": 8, "tender": tender.to_dict(),
+             "parserVersion": PARSER_VERSION, "tender": tender.to_dict(),
              "selection": {"lotCodes": ["分标1"], "packageNo": "包2", "signDate": "2026-11-17"},
              "tree": [{"name": "招标正文.docx", "logical_path": "招标正文.docx", "chain": [],
                        "depth": 0, "suffix": ".docx", "size": 1, "storage_path": "招标正文.docx", "children": []}],
@@ -249,6 +252,60 @@ async def test_backfill_and_delete_do_not_resurrect_task(setup_bridge, monkeypat
     await bid_gen.delete_task(task["id"], user, db)
     assert (await bid_gen.list_tasks(user, db))["data"] == []
     assert (await records.list_records(db))["total"] == 0
+
+
+def test_new_task_keeps_nested_word_locks_only_in_archive_tree(tmp_path):
+    title = "独立样例设备采购及安装项目"
+    document = Document()
+    document.add_paragraph(f"{title}投标邀请书")
+    original = BytesIO()
+    document.save(original)
+    inner = BytesIO()
+    with ZipFile(inner, "w") as package:
+        package.writestr("包01/~$投标邀请书.DOCX", b"word lock")
+        package.writestr("包01/投标邀请书.docx", original.getvalue())
+    upload = tmp_path / "招标资料.zip"
+    with ZipFile(upload, "w") as package:
+        package.writestr("分包.zip", inner.getvalue())
+
+    service = BidGenService(tmp_path, 7)
+    task = service.create_task(upload.name, upload)
+    state = service._load(task["id"])
+
+    assert task["status"] == "parsed"
+    assert task["tender"]["projectName"] == title
+    assert [(item["logicalPath"], item["role"]) for item in state["tender"]["files"]] == [
+        ("分包.zip", "archive"),
+        ("分包.zip/包01/投标邀请书.docx", "invitation"),
+    ]
+    assert all("~$" not in warning for warning in state["tender"]["warnings"])
+    lock, invitation = state["tree"][0]["children"]
+    assert lock["logical_path"] == "分包.zip/包01/~$投标邀请书.DOCX"
+    assert lock["chain"] == invitation["chain"] == ["分包.zip"]
+    assert (service._folder(task["id"]) / "workspace" / lock["storage_path"]).read_bytes() == b"word lock"
+
+
+@pytest.mark.asyncio
+async def test_backfill_ignores_word_locks_in_saved_tree(setup_bridge, monkeypatch):
+    db, service, task, user = setup_bridge
+    monkeypatch.setattr(bid_gen, "_service", lambda u: service)
+    state = service._load(task["id"])
+    workspace = service._folder(task["id"]) / "workspace"
+    for name, role in (("~$投标邀请书.docx", "invitation"), ("~$招标文件.docx", "main")):
+        (workspace / name).write_bytes(b"word lock")
+        state["tree"].insert(0, ArchiveEntry(name, name, [], 0, ".docx", 9, name).to_dict())
+        state["tender"]["files"].append({"logicalPath": name, "role": role})
+    service._save(state)
+
+    listed = await bid_gen.list_tasks(user, db)
+
+    assert listed["data"][0]["recordId"] == task["id"]
+    assert listed["data"][0]["status"] == "generated"
+    row = await bridge.find_record(db, task["id"])
+    assert load_invitation_text(row.brief_json["invitationId"]) == (
+        "项目名称：独立样例采购；投标有效期90日；人员方案最高10分。"
+    )
+    assert service._load(task["id"]) == state
 
 
 @pytest.mark.asyncio
